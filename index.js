@@ -1186,6 +1186,126 @@ function getReconnectDelay() {
   return delay + jitter;
 }
 
+// The pathfinder's stock door support only adds fence gates to its openable
+// set. It also treats the upper half of a wooden door as a solid wall when
+// canDig=false (which this bot intentionally uses). Mark both door halves as
+// safe for path calculation, and only queue an interaction for the closed
+// lower half / closed trapdoor / closed fence gate.
+function configureDoorAwareMovements(bot, movements) {
+  if (!bot || !movements || typeof movements.getBlock !== "function") return;
+  movements.canOpenDoors = true;
+  if (!movements.openable) movements.openable = new Set();
+
+  for (const blockInfo of bot.registry.blocksArray || []) {
+    const name = String(blockInfo.name || "");
+    const woodenDoor = name.endsWith("_door") && !name.startsWith("iron_");
+    const woodenTrapdoor = name.endsWith("_trapdoor") && !name.startsWith("iron_");
+    const fenceGate = name.endsWith("_fence_gate");
+    if ((woodenDoor || woodenTrapdoor || fenceGate) && Number.isInteger(blockInfo.id)) {
+      movements.openable.add(blockInfo.id);
+    }
+  }
+
+  const getBlockOriginal = movements.getBlock.bind(movements);
+  movements.getBlock = function (pos, dx, dy, dz) {
+    const block = getBlockOriginal(pos, dx, dy, dz);
+    if (!block || !block.position || !block.name) return block;
+
+    const name = String(block.name);
+    const isDoor = name.endsWith("_door") && !name.startsWith("iron_");
+    const isTrapdoor = name.endsWith("_trapdoor") && !name.startsWith("iron_");
+    const isGate = name.endsWith("_fence_gate");
+    if (!isDoor && !isTrapdoor && !isGate) return block;
+
+    const properties = typeof block.getProperties === "function"
+      ? block.getProperties()
+      : (block._properties || block.properties || {});
+
+    // An openable block must not be sent to safeOrBreak: with canDig=false
+    // that makes the route impossible, and with canDig=true it would break it.
+    block.safe = true;
+
+    if (isDoor) {
+      const upperHalf = properties.half === "upper";
+      const lowerBlock = upperHalf
+        ? bot.blockAt(block.position.offset(0, -1, 0))
+        : block;
+      const lowerProperties = lowerBlock && typeof lowerBlock.getProperties === "function"
+        ? lowerBlock.getProperties()
+        : (lowerBlock && (lowerBlock._properties || lowerBlock.properties)) || properties;
+      block.openable = !upperHalf && lowerProperties.open !== true;
+    } else {
+      // Do not click an already-open block: activating it would close it again
+      // and could trap the bot on the next path update.
+      block.openable = properties.open !== true;
+    }
+    return block;
+  };
+
+  // Remember passages opened by the pathfinder and close them again after the
+  // bot has crossed. This prevents doors/gates being left open while avoiding
+  // toggling a block that was already open before the bot reached it.
+  const openedPassages = new Map();
+  const activateBlockOriginal = typeof bot.activateBlock === "function"
+    ? bot.activateBlock.bind(bot)
+    : null;
+  if (activateBlockOriginal) {
+    bot.activateBlock = async function (block, ...args) {
+      const name = String(block && block.name || "");
+      const isPassage = (name.endsWith("_door") && !name.startsWith("iron_")) ||
+        (name.endsWith("_trapdoor") && !name.startsWith("iron_")) ||
+        name.endsWith("_fence_gate");
+      const properties = block && typeof block.getProperties === "function"
+        ? block.getProperties()
+        : (block && (block._properties || block.properties)) || {};
+      const wasClosed = isPassage && properties.open !== true;
+
+      const result = await activateBlockOriginal(block, ...args);
+      if (wasClosed && block.position && bot.entity) {
+        const key = block.position.x + "," + block.position.y + "," + block.position.z;
+        openedPassages.set(key, {
+          position: block.position.clone(),
+          startPosition: bot.entity.position.clone(),
+          openedAt: Date.now(),
+          closing: false,
+        });
+      }
+      return result;
+    };
+
+    bot.on("physicsTick", () => {
+      if (!bot.entity || !openedPassages.size || bot.usingHeldItem) return;
+      const now = Date.now();
+      for (const [key, passage] of openedPassages) {
+        if (passage.closing || now - passage.openedAt < 900) continue;
+        const block = bot.blockAt(passage.position);
+        if (!block) {
+          openedPassages.delete(key);
+          continue;
+        }
+        const properties = typeof block.getProperties === "function"
+          ? block.getProperties()
+          : (block._properties || block.properties || {});
+        if (properties.open !== true) {
+          openedPassages.delete(key);
+          continue;
+        }
+
+        const distance = bot.entity.position.distanceTo(passage.position);
+        const movedPast = bot.entity.position.distanceTo(passage.startPosition) > 1.25;
+        if (movedPast && distance > 1.35 && distance <= 4.5) {
+          passage.closing = true;
+          Promise.resolve(activateBlockOriginal(block))
+            .catch(() => {})
+            .finally(() => openedPassages.delete(key));
+        } else if (distance > 8 || now - passage.openedAt > 12000) {
+          openedPassages.delete(key);
+        }
+      }
+    });
+  }
+}
+
 function createBot() {
   if (isReconnecting) {
     addLog("[Bot] Already reconnecting, skipping...");
@@ -1278,6 +1398,7 @@ function createBot() {
       defaultMove.liquidCost = 1000;
       defaultMove.fallDamageCost = 1000;
       defaultMove.allow1by1towers = false;
+      configureDoorAwareMovements(bot, defaultMove);
 
       initializeModules(bot, mcData, defaultMove);
 
@@ -1627,8 +1748,9 @@ function initializeModules(bot, mcData, defaultMove) {
   if (config.modules.avoidMobs && !config.modules.combat) {
     avoidMobs(bot);
   }
-  if (config.modules.combat) {
-    combatModule(bot, mcData);
+  // Auto-eat is independent of the optional mob-combat module.
+  if (config.modules.combat || (config.combat && config.combat["auto-eat"])) {
+    combatModule(bot, mcData, !!config.modules.combat);
   }
   if (config.modules.beds) {
     bedModule(bot, mcData);
@@ -1748,26 +1870,24 @@ function avoidMobs(bot) {
 }
 
 // Combat module
-// FIX: attack cooldown for 1.9+ (600ms minimum between attacks)
-// FIX: lock onto a target for multiple ticks instead of randomly switching every tick
-// FIX: autoEat - use i.foodPoints directly (mineflayer item property) instead of broken mcData lookup
-function combatModule(bot, mcData) {
+// Respects the 1.9+ attack cooldown, keeps a target briefly, and auto-eats
+// from every edible item known to the active Minecraft registry.
+function combatModule(bot, mcData, enableMobCombat = true) {
   let lastAttackTime = 0;
   let lockedTarget = null;
   let lockedTargetExpiry = 0;
+  let eatingNow = false;
+  let lastEatAttempt = 0;
 
-  // FIX: use physicsTick (not the deprecated physicTick)
   bot.on("physicsTick", () => {
     if (!bot || !botState.connected) return;
-    if (!config.combat["attack-mobs"]) return;
-    if (!cmd.isIdle()) return; // !guard / !kill / !pvp handle their own fighting
+    if (!enableMobCombat || !config.combat["attack-mobs"]) return;
+    if (!cmd.isIdle() || cmd.ctx.eating) return; // command modes manage their own combat
 
     const now = Date.now();
-    // FIX: 1.9+ attack cooldown - respect at least 600ms between swings
     if (now - lastAttackTime < 620) return;
 
     try {
-      // FIX: only pick a new target if current one is gone or lock expired
       if (
         lockedTarget &&
         now < lockedTargetExpiry &&
@@ -1779,21 +1899,16 @@ function combatModule(bot, mcData) {
           bot.attack(lockedTarget);
           lastAttackTime = now;
           return;
-        } else {
-          lockedTarget = null;
         }
+        lockedTarget = null;
       }
 
-      // Pick a new target
       const mobs = Object.values(bot.entities).filter(
-        (e) =>
-          isHostile(e) &&
-          e.position &&
-          bot.entity.position.distanceTo(e.position) < 4,
+        (e) => isHostile(e) && e.position && bot.entity.position.distanceTo(e.position) < 4,
       );
       if (mobs.length > 0) {
         lockedTarget = mobs[0];
-        lockedTargetExpiry = now + 3000; // stick to same mob for 3 seconds
+        lockedTargetExpiry = now + 3000;
         bot.attack(lockedTarget);
         lastAttackTime = now;
       }
@@ -1802,29 +1917,66 @@ function combatModule(bot, mcData) {
     }
   });
 
-  // FIX: autoEat - check foodPoints property on the item directly (works reliably)
-  bot.on("health", () => {
-    if (!config.combat["auto-eat"]) return;
+  function foodData(item) {
+    const registry = bot.registry || {};
+    const foods = registry.foodsByName || mcData.foodsByName || {};
+    const food = foods[item.name] || (registry.foods && registry.foods[item.name]) || {};
+    const itemFoodPoints = Number(item.foodPoints);
+    const itemSaturation = Number(item.saturation);
+    const foodPoints = itemFoodPoints > 0 ? itemFoodPoints : Number(food.foodPoints || 0);
+    const saturation = itemSaturation > 0 ? itemSaturation : Number(food.saturation || 0);
+    return { foodPoints, saturation };
+  }
+
+  async function tryAutoEat() {
+    if (!config.combat["auto-eat"] || !bot || !botState.connected || !bot.entity) return;
+    if (eatingNow || cmd.ctx.eating || bot.food >= 18 || Date.now() - lastEatAttempt < 1200) return;
+    lastEatAttempt = Date.now();
+
+    const choices = bot.inventory.items()
+      .map((item) => ({ item, data: foodData(item) }))
+      .filter((entry) => entry.data.foodPoints > 0)
+      .sort((a, b) =>
+        b.data.foodPoints - a.data.foodPoints || b.data.saturation - a.data.saturation,
+      );
+    if (!choices.length) return;
+
+    const food = choices[0].item;
+    const previousHeld = bot.heldItem;
+    eatingNow = true;
+    cmd.ctx.eating = true;
     try {
-      if (bot.food < 14) {
-        if (cmd.ctx.eating) return;
-        if (cmd.ctx.mode === "pvp" && bot.food > 6) return;
-        const food = bot.inventory
-          .items()
-          .find((i) => i.foodPoints && i.foodPoints > 0);
-        if (food) {
-          cmd.ctx.eating = true;
-          bot
-            .equip(food, "hand")
-            .then(() => bot.consume())
-            .catch((e) => addLog("[AutoEat] Error:", e.message))
-            .finally(() => {
-              cmd.ctx.eating = false;
-            });
-        }
-      }
+      await bot.equip(food, "hand");
+      await bot.consume();
     } catch (e) {
       addLog("[AutoEat] Error:", e.message);
+    } finally {
+      try {
+        // Restore the previous hand item when the same stack still exists.
+        if (previousHeld && previousHeld.name !== food.name) {
+          const restore = bot.inventory.items().find(
+            (item) => item.name === previousHeld.name && item.metadata === previousHeld.metadata,
+          );
+          if (restore) await bot.equip(restore, "hand");
+        }
+      } catch (e) {
+        // The prior item may have been moved or consumed in the meantime.
+      }
+      eatingNow = false;
+      cmd.ctx.eating = false;
+    }
+  }
+
+  // physicsTick makes eating reliable even when a server does not emit a
+  // separate health event for every hunger update.
+  bot.on("physicsTick", () => {
+    if (bot && botState.connected && bot.food < 18) {
+      tryAutoEat().catch((e) => addLog("[AutoEat] Error:", e.message));
+    }
+  });
+  bot.on("health", () => {
+    if (bot && botState.connected && bot.food < 18) {
+      tryAutoEat().catch((e) => addLog("[AutoEat] Error:", e.message));
     }
   });
 }

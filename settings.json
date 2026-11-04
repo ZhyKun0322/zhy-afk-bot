@@ -1,12 +1,12 @@
 {
   "name": "AFK Bot",
   "bot-account": {
-    "username": "ZhyBot",
+    "username": "SoloCloudHosting",
     "password": "",
     "type": "offline"
   },
   "server": {
-    "ip": "tempestcraft.mcsh.gg",
+    "ip": "solocloud.host",
     "port": 25565,
     "version": "1.20.1",
     "try-creative": false
@@ -116,7 +116,10 @@
       "bow-min-range": 8,
       "bow-max-range": 30,
       "bow-draw-ms": 1100,
-      "aim-latency-ticks": 2
+      "aim-latency-ticks": 2,
+      "use-shield": true,
+      "retreat-health": 10,
+      "recover-health": 16
     }
   }
 }

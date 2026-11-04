@@ -237,25 +237,124 @@ function reachDistance(bot, target) {
 // re-issuing the same goal every tick.
 function createNav(bot) {
   let key = null;
+  let followState = null;
+  let lastFollowPosition = null;
+  let lastFollowProgress = 0;
+  let lastFollowRecovery = 0;
+  let gotoState = null;
+  let lastGotoPosition = null;
+  let lastGotoProgress = 0;
+  let lastGotoRecovery = 0;
+
+  function followGoal(entity, range) {
+    return new goals.GoalFollow(entity, range);
+  }
+
   return {
     follow(entity, range = 2) {
       const k = "f:" + entity.id + ":" + range;
-      if (k === key) return;
-      key = k;
-      bot.pathfinder.setGoal(new goals.GoalFollow(entity, range), true);
+      if (k !== key) {
+        key = k;
+        followState = { entity, range };
+        gotoState = null;
+        lastGotoPosition = null;
+        lastFollowPosition = bot.entity && bot.entity.position.clone();
+        lastFollowProgress = Date.now();
+        lastFollowRecovery = 0;
+        bot.pathfinder.setGoal(followGoal(entity, range), true);
+        return;
+      }
+
+      // GoalFollow is dynamic, but the path executor can remain wedged against
+      // a collision edge or a closed interactable block. Re-issue the goal if
+      // the target is still out of range and the bot has not made progress.
+      if (!followState || !bot.entity || !entity.position) return;
+      const now = Date.now();
+      const position = bot.entity.position;
+      const moved = lastFollowPosition ? position.distanceTo(lastFollowPosition) : 0;
+      if (moved >= 0.12) {
+        lastFollowPosition = position.clone();
+        lastFollowProgress = now;
+      }
+
+      const distance = position.distanceTo(entity.position);
+      if (distance <= range + 0.8) {
+        lastFollowPosition = position.clone();
+        lastFollowProgress = now;
+        return;
+      }
+
+      if (now - lastFollowProgress > 2200 && now - lastFollowRecovery > 2200) {
+        lastFollowRecovery = now;
+        lastFollowProgress = now;
+        lastFollowPosition = position.clone();
+        try {
+          bot.pathfinder.setGoal(null);
+          bot.pathfinder.setGoal(followGoal(entity, range), true);
+        } catch (e) {
+          // A new path will be attempted on the next follow tick.
+          key = null;
+        }
+      }
     },
     goto(x, y, z, range = 1) {
-      key = "g:" + x + "," + y + "," + z;
-      bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, range));
+      const nextKey = "g:" + Math.floor(x) + "," + Math.floor(y) + "," + Math.floor(z) + ":" + range;
+      const now = Date.now();
+      if (nextKey !== key) {
+        key = nextKey;
+        followState = null;
+        lastFollowPosition = null;
+        gotoState = { x, y, z, range };
+        lastGotoPosition = bot.entity && bot.entity.position.clone();
+        lastGotoProgress = now;
+        lastGotoRecovery = 0;
+        bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, range));
+        return;
+      }
+
+      // Static destinations (such as a PvP retreat point) need the same
+      // stuck recovery as dynamic follow goals.
+      if (!gotoState || !bot.entity) return;
+      const position = bot.entity.position;
+      const moved = lastGotoPosition ? position.distanceTo(lastGotoPosition) : 0;
+      if (moved >= 0.12) {
+        lastGotoPosition = position.clone();
+        lastGotoProgress = now;
+      }
+      const distance = position.distanceTo({ x: gotoState.x, y: gotoState.y, z: gotoState.z });
+      if (distance <= gotoState.range + 0.8) {
+        lastGotoPosition = position.clone();
+        lastGotoProgress = now;
+        return;
+      }
+      if (now - lastGotoProgress > 2200 && now - lastGotoRecovery > 2200) {
+        lastGotoRecovery = now;
+        lastGotoProgress = now;
+        lastGotoPosition = position.clone();
+        try {
+          bot.pathfinder.setGoal(null);
+          bot.pathfinder.setGoal(new goals.GoalNear(gotoState.x, gotoState.y, gotoState.z, gotoState.range));
+        } catch (e) {
+          key = null;
+        }
+      }
     },
     stop() {
       if (key !== null) {
         key = null;
+        followState = null;
+        lastFollowPosition = null;
+        gotoState = null;
+        lastGotoPosition = null;
         bot.pathfinder.setGoal(null);
       }
     },
     forget() {
       key = null;
+      followState = null;
+      lastFollowPosition = null;
+      gotoState = null;
+      lastGotoPosition = null;
     },
   };
 }

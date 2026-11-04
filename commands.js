@@ -15,6 +15,9 @@ const ctx = {
   home: null, // { x, y, z } fixed position saved with !radius
   eating: false, // set by auto-eat so combat doesn't fight the eating
   pickup: false, // collecting drops
+  autoSleep: false, // !sleep toggles automatic night-time bed use
+  sleepNavigating: false,
+  autoArmor: false, // !armor toggles armor + shield equipment
   token: 0, // bumps on every mode change - cancels old async loops
 };
 
@@ -36,6 +39,9 @@ const DEFAULTS = {
     "bow-max-range": 30,
     "bow-draw-ms": 1100,
     "aim-latency-ticks": 2,
+    "use-shield": true,
+    "retreat-health": 10,
+    "recover-health": 16,
   },
 };
 
@@ -60,7 +66,7 @@ function hasHome() {
 }
 // true when the bot should stand still instead of wandering (anti-AFK circle walk etc.)
 function isStationary() {
-  return ctx.mode !== "idle" || ctx.home !== null;
+  return ctx.mode !== "idle" || ctx.home !== null || ctx.sleepNavigating;
 }
 
 function loadHome(config) {
@@ -109,6 +115,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
   ctx.owner = null;
   ctx.eating = false;
   ctx.pickup = false;
+  ctx.sleepNavigating = false;
   ctx.token++;
 
   bot.pathfinder.setMovements(defaultMove);
@@ -152,8 +159,224 @@ function initCommands(bot, mcData, defaultMove, deps) {
     onEnd: () => stopMode(false),
   });
 
+  // ---------- armor helpers ----------
+  const armorSlots = [
+    { destination: "head", slot: 5, test: (name) => /_(helmet|cap)$/.test(name) || name === "turtle_helmet" },
+    { destination: "torso", slot: 6, test: (name) => /_chestplate$/.test(name) || name === "elytra" },
+    { destination: "legs", slot: 7, test: (name) => /_leggings$/.test(name) },
+    { destination: "feet", slot: 8, test: (name) => /_boots$/.test(name) },
+  ];
+  const armorMaterialRank = {
+    netherite: 7,
+    diamond: 6,
+    iron: 5,
+    chainmail: 4,
+    gold: 3,
+    golden: 3,
+    turtle: 3,
+    leather: 2,
+  };
+  let armorBusy = false;
+
+  function armorScore(item) {
+    if (!item) return 0;
+    const name = item.name || "";
+    const material = Object.keys(armorMaterialRank).find((m) => name.startsWith(m + "_"));
+    return material ? armorMaterialRank[material] : name === "elytra" ? 1 : 0;
+  }
+
+  function itemInEquipmentSlot(slot) {
+    return bot.inventory && bot.inventory.slots ? bot.inventory.slots[slot] || null : null;
+  }
+
+  async function equipBestArmor() {
+    if (armorBusy || !bot.entity) return;
+    armorBusy = true;
+    try {
+      for (const rule of armorSlots) {
+        const best = bot.inventory.items()
+          .filter((item) => rule.test(item.name))
+          .sort((a, b) => armorScore(b) - armorScore(a))[0];
+        const current = itemInEquipmentSlot(rule.slot);
+        if (best && armorScore(best) > armorScore(current)) {
+          await bot.equip(best, rule.destination);
+        }
+      }
+
+      const shield = bot.inventory.items().find((item) => item.name === "shield");
+      const offhand = itemInEquipmentSlot(45);
+      if (shield && (!offhand || offhand.name !== "shield")) {
+        await bot.equip(shield, "off-hand");
+      }
+    } catch (e) {
+      log("armor equip error: " + e.message);
+    } finally {
+      armorBusy = false;
+    }
+  }
+
+  async function unequipArmor() {
+    if (armorBusy || !bot.entity) return;
+    armorBusy = true;
+    try {
+      for (const destination of ["head", "torso", "legs", "feet", "off-hand"]) {
+        try {
+          await bot.unequip(destination);
+        } catch (e) {
+          // An empty equipment slot is normal.
+        }
+      }
+    } finally {
+      armorBusy = false;
+    }
+  }
+
+  // Keep the best available gear equipped while !armor is enabled.
+  addInterval(() => {
+    if (ctx.autoArmor && bot.entity && !ctx.eating) equipBestArmor();
+  }, 5000);
+
+  // ---------- automatic sleeping ----------
+  let sleepAttempt = false;
+  let sleepBedKey = null;
+  let lastBedSearch = 0;
+  let lastNoBedNotice = 0;
+
+  function isNight() {
+    const timeOfDay = bot.time && Number(bot.time.timeOfDay);
+    return Number.isFinite(timeOfDay) && timeOfDay >= 12542 && timeOfDay <= 23460;
+  }
+
+  async function autoSleepTick() {
+    if (!ctx.autoSleep || !bot.entity) {
+      return;
+    }
+    if (bot.isSleeping || sleepAttempt) return;
+    if (!isNight()) {
+      if (ctx.sleepNavigating) {
+        ctx.sleepNavigating = false;
+        sleepBedKey = null;
+        if (ctx.home) goHome();
+        else bot.pathfinder.setGoal(null);
+      }
+      return;
+    }
+    // Do not interrupt active combat, harvesting, or player-follow commands.
+    if (ctx.mode !== "idle" || ctx.eating || ctx.pickup || bot.currentWindow) return;
+    const now = Date.now();
+    if (now - lastBedSearch < 5000) return;
+    lastBedSearch = now;
+
+    const bed = bot.findBlock({
+      matching: (block) => block && typeof bot.isABed === "function" && bot.isABed(block),
+      maxDistance: 16,
+    });
+    if (!bed) {
+      if (ctx.sleepNavigating) {
+        ctx.sleepNavigating = false;
+        sleepBedKey = null;
+        bot.pathfinder.setGoal(null);
+      }
+      if (now - lastNoBedNotice > 60000) {
+        lastNoBedNotice = now;
+        say("Auto-sleep is on, but I can't find a bed within 16 blocks.");
+      }
+      return;
+    }
+
+    const distance = bot.entity.position.distanceTo(bed.position);
+    const bedKey = `${bed.position.x},${bed.position.y},${bed.position.z}`;
+    if (distance > 3.2) {
+      ctx.sleepNavigating = true;
+      if (sleepBedKey !== bedKey) {
+        sleepBedKey = bedKey;
+        try {
+          bot.pathfinder.setGoal(new goals.GoalNear(bed.position.x, bed.position.y, bed.position.z, 1));
+        } catch (e) {
+          ctx.sleepNavigating = false;
+          sleepBedKey = null;
+        }
+      }
+      return;
+    }
+
+    sleepAttempt = true;
+    ctx.sleepNavigating = true; // keep anti-AFK movement from interrupting the sleep action
+    sleepBedKey = null;
+    try {
+      bot.pathfinder.setGoal(null);
+      await bot.sleep(bed);
+      say("Sleeping now.");
+    } catch (e) {
+      // Server may deny sleep because it is not quite night or monsters are nearby.
+      ctx.sleepNavigating = false;
+    } finally {
+      sleepAttempt = false;
+    }
+  }
+
+  addInterval(() => {
+    autoSleepTick().catch((e) => log("auto-sleep error: " + e.message));
+  }, 2500);
+
+  bot.on("wake", () => {
+    ctx.sleepNavigating = false;
+    sleepBedKey = null;
+  });
+
+  async function dropAllInventory() {
+    if (!bot.entity) return;
+    // Stop jobs and auto-equipping first so nothing fights the drop operation.
+    stopMode(true);
+    ctx.autoArmor = false;
+    ctx.sleepNavigating = false;
+    sleepBedKey = null;
+    try {
+      bot.pathfinder.setGoal(null);
+    } catch (e) {}
+
+    let droppedStacks = 0;
+    let droppedItems = 0;
+    async function tossStoredItems() {
+      // Re-read the inventory after every toss because slot references shift.
+      for (let guard = 0; guard < 80; guard++) {
+        const item = bot.inventory.items()[0];
+        if (!item) break;
+        const count = item.count || 1;
+        await bot.tossStack(item);
+        droppedStacks++;
+        droppedItems += count;
+        await sleep(80);
+      }
+    }
+
+    try {
+      // Clear normal slots first, making room for armor that is unequipped next.
+      if (bot.currentWindow) {
+        try { bot.closeWindow(bot.currentWindow); } catch (e) {}
+      }
+      await tossStoredItems();
+      for (const destination of ["head", "torso", "legs", "feet", "off-hand"]) {
+        try {
+          await bot.unequip(destination);
+          await sleep(80);
+          await tossStoredItems();
+        } catch (e) {
+          // Empty equipment slots are expected.
+        }
+      }
+      await tossStoredItems();
+      say("Dropped " + droppedItems + " items in " + droppedStacks + " stacks, including equipped armor and off-hand.");
+    } catch (e) {
+      say("Inventory drop stopped: " + e.message);
+      log("inventory drop error: " + e.message);
+    }
+  }
+
   function startMode(mode, owner) {
     stopMode(true);
+    ctx.sleepNavigating = false;
+    sleepBedKey = null;
     ctx.mode = mode;
     ctx.owner = owner || null;
     killState.target = null;
@@ -498,7 +721,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
   function run(name, args, username) {
     switch (name) {
       case "help":
-        say("!wood [n] !follow !kill !guard !unguard !radius !unsave !pvp [name] !stop");
+        say("!wood [n] !follow !kill !guard !unguard !pvp [name] !sleep !armor !inventory !radius !unsave !stop");
         return;
 
       case "stop":
@@ -525,6 +748,44 @@ function initCommands(bot, mcData, defaultMove, deps) {
           bot.pathfinder.setGoal(null);
         }
         say("Fixed position cleared.");
+        return;
+
+      case "sleep": {
+        ctx.autoSleep = !ctx.autoSleep;
+        if (ctx.autoSleep) {
+          say("Auto-sleep enabled. I'll look for a nearby bed at night. Type !sleep again to disable it.");
+          autoSleepTick().catch((e) => log("auto-sleep error: " + e.message));
+        } else {
+          const wasSleepNavigating = ctx.sleepNavigating;
+          ctx.sleepNavigating = false;
+          sleepBedKey = null;
+          try {
+            // Only clear the pathfinder goal when it belongs to auto-sleep.
+            if (wasSleepNavigating && ctx.mode === "idle") {
+              bot.pathfinder.setGoal(null);
+              if (ctx.home) goHome();
+            }
+            if (bot.isSleeping) bot.wake().catch(() => {});
+          } catch (e) {}
+          say("Auto-sleep disabled.");
+        }
+        return;
+      }
+
+      case "armor":
+        ctx.autoArmor = !ctx.autoArmor;
+        if (ctx.autoArmor) {
+          say("Auto-armor enabled. Equipping the best armor and shield available.");
+          equipBestArmor().catch((e) => log("armor equip error: " + e.message));
+        } else {
+          say("Auto-armor disabled. Unequipping armor and off-hand shield.");
+          unequipArmor().catch((e) => log("armor unequip error: " + e.message));
+        }
+        return;
+
+      case "inventory":
+        say("Dropping everything from my inventory and equipment...");
+        dropAllInventory().catch((e) => log("inventory drop error: " + e.message));
         return;
 
       case "wood": {

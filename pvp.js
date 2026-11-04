@@ -24,6 +24,11 @@ function createPvp(bot, deps) {
   let strafeDir = 0;
   let strafeUntil = 0;
   let equipping = false;
+  let equippingShield = false;
+  let shieldBlocking = false;
+  let retreating = false;
+  let retreatStarted = 0;
+  let retreatGoal = null;
 
   function cancelDraw() {
     if (drawing) {
@@ -36,12 +41,16 @@ function createPvp(bot, deps) {
 
   function reset() {
     cancelDraw();
+    releaseShield();
     active = false;
     targetName = null;
     lostSince = 0;
     trackedId = null;
     bowMode = false;
     noArrowsTold = false;
+    retreating = false;
+    retreatStarted = 0;
+    retreatGoal = null;
     tracker.reset();
   }
 
@@ -59,6 +68,7 @@ function createPvp(bot, deps) {
   function stop() {
     nav.stop();
     melee.release();
+    releaseShield();
     reset();
     for (const c of ["left", "right", "forward", "back", "sprint"]) {
       if (bot.controlState[c]) bot.setControlState(c, false);
@@ -79,6 +89,103 @@ function createPvp(bot, deps) {
     lastInv = now;
     bowItem = U.findBow(bot);
     arrows = U.countArrows(bot);
+  }
+
+  function offhandItem() {
+    return bot.inventory && bot.inventory.slots ? bot.inventory.slots[45] || null : null;
+  }
+
+  function ensureShield() {
+    if (cfg["use-shield"] === false || equippingShield) return;
+    const offhand = offhandItem();
+    if (offhand && offhand.name === "shield") return;
+    const shield = bot.inventory.items().find((item) => item.name === "shield");
+    if (!shield) return;
+    equippingShield = true;
+    bot.equip(shield, "off-hand")
+      .catch(() => {})
+      .finally(() => {
+        equippingShield = false;
+      });
+  }
+
+  function releaseShield() {
+    if (!shieldBlocking) return;
+    shieldBlocking = false;
+    try {
+      bot.deactivateItem();
+    } catch (e) {}
+  }
+
+  function targetFacingBot(target) {
+    if (!target || !bot.entity || !Number.isFinite(target.yaw)) return false;
+    const dx = bot.entity.position.x - target.position.x;
+    const dz = bot.entity.position.z - target.position.z;
+    const length = Math.hypot(dx, dz);
+    if (length < 0.001) return true;
+    // Minecraft yaw 0 faces north (-Z).
+    const facingX = -Math.sin(target.yaw);
+    const facingZ = -Math.cos(target.yaw);
+    return (facingX * dx + facingZ * dz) / length > 0.2;
+  }
+
+  function shieldStep(target, distance, enabled) {
+    const canBlock = enabled && cfg["use-shield"] !== false &&
+      offhandItem() && offhandItem().name === "shield" &&
+      distance <= 5.2 && targetFacingBot(target);
+    if (canBlock && !shieldBlocking) {
+      try {
+        bot.activateItem(true);
+        shieldBlocking = true;
+      } catch (e) {}
+    } else if (!canBlock) {
+      releaseShield();
+    }
+  }
+
+  function retreatStep(target, now) {
+    const health = Number(bot.health);
+    const food = Number(bot.food);
+    const lowHealth = Number.isFinite(health) && health <= (cfg["retreat-health"] || 10);
+    if (!retreating && lowHealth) {
+      retreating = true;
+      retreatStarted = now;
+      retreatGoal = null;
+      say("Low health! Retreating to eat and recover.");
+    }
+
+    if (!retreating) return false;
+    if (health >= (cfg["recover-health"] || 16) && food >= 18) {
+      retreating = false;
+      retreatStarted = 0;
+      retreatGoal = null;
+      nav.stop();
+      say("Recovered! Returning to the fight.");
+      return false;
+    }
+
+    // Keep a stable retreat waypoint; moving it every tick would continually
+    // reset pathfinding and prevent the bot from reaching safety.
+    const targetDistance = bot.entity.position.distanceTo(target.position);
+    if (!retreatGoal || targetDistance < 7 || bot.entity.position.distanceTo(retreatGoal) < 3) {
+      const dx = bot.entity.position.x - target.position.x;
+      const dz = bot.entity.position.z - target.position.z;
+      const length = Math.max(0.001, Math.hypot(dx, dz));
+      retreatGoal = {
+        x: bot.entity.position.x + (dx / length) * 12,
+        y: bot.entity.position.y,
+        z: bot.entity.position.z + (dz / length) * 12,
+      };
+    }
+    nav.goto(retreatGoal.x, retreatGoal.y, retreatGoal.z, 2);
+    shieldStep(target, targetDistance, true);
+
+    if (now - retreatStarted > 45000 && health > 0 && health <= 10) {
+      // Do not blindly resume at critical health. Stay defensive until recovery.
+      say("Still recovering; keeping distance from the target.");
+      retreatStarted = now;
+    }
+    return true;
   }
 
   async function equipBow() {
@@ -108,6 +215,7 @@ function createPvp(bot, deps) {
   }
 
   function bowStep(target, d, now) {
+    releaseShield();
     nav.stop();
     melee.release();
 
@@ -152,6 +260,8 @@ function createPvp(bot, deps) {
   function tick() {
     if (!active || !bot.entity) return;
     const now = Date.now();
+    // Eating/equipping can end off-hand use; allow the shield to be raised again.
+    if (shieldBlocking && !bot.usingHeldItem) shieldBlocking = false;
 
     const rec = U.findPlayer(bot, targetName);
     const target = rec && rec.entity;
@@ -173,6 +283,9 @@ function createPvp(bot, deps) {
 
     const d = bot.entity.position.distanceTo(target.position);
     refreshInventory(false);
+    ensureShield();
+
+    if (retreatStep(target, now)) return;
 
     const canBow = cfg["use-bow"] && bowItem && arrows > 0;
     let wantBow = false;
@@ -196,6 +309,10 @@ function createPvp(bot, deps) {
       U.setCtl(bot, "left", false);
       U.setCtl(bot, "right", false);
     }
+
+    // Raise the off-hand shield when the opponent is close and facing the bot.
+    // Melee attacks still run below, so the bot does not just stand and block.
+    shieldStep(target, d, true);
 
     melee.step(target, {
       crit: cfg["crit-jumps"],

@@ -5,7 +5,7 @@
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --check index.js"
+    "test": "node --check index.js && node --check commands.js && node --check pvp.js && node --check combatUtils.js && node -e \"JSON.parse(require('fs').readFileSync('settings.json', 'utf8'))\""
   },
   "author": "Lamgerr",
   "license": "MIT",
