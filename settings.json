@@ -1,12 +1,12 @@
 {
   "name": "ZhyBot",
   "bot-account": {
-    "username": "tempestcraft.mcsh.gg",
+    "username": "ZhyBot",
     "password": "",
     "type": "offline"
   },
   "server": {
-    "ip": "solocloud.host",
+    "ip": "tempestcraft.mcsh.gg",
     "port": 25565,
     "version": "1.20.1",
     "try-creative": false
