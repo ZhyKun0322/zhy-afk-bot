@@ -447,9 +447,9 @@ function initCommands(bot, mcData, defaultMove, deps) {
         resolve(ok);
       };
       const timer = setTimeout(() => {
-        try {
-          bot.pathfinder.setGoal(null);
-        } catch (e) {}
+        // Cancel the navigation wrapper too, not just the pathfinder goal. This
+        // releases gotoGoal listeners and avoids orphaned movement promises.
+        try { nav.stop(); } catch (e) {}
         finish(false);
       }, ms);
       nav.gotoGoal(goal)
@@ -516,6 +516,22 @@ function initCommands(bot, mcData, defaultMove, deps) {
     return null;
   }
 
+  function logLookGoal(position) {
+    // GoalLookAtBlock plans to a spot from which a face of the log is visible
+    // and within reach. Unlike GoalNear(3), this does not declare success while
+    // the bot is still too far away or hidden behind leaves.
+    if (typeof goals.GoalLookAtBlock === "function" && bot.world) {
+      return new goals.GoalLookAtBlock(position, bot.world, {
+        reach: 4.5,
+        entityHeight: bot.entity ? bot.entity.height : 1.6,
+      });
+    }
+    if (typeof goals.GoalGetToBlock === "function") {
+      return new goals.GoalGetToBlock(position.x, position.y, position.z);
+    }
+    return new goals.GoalNear(position.x, position.y, position.z, 1);
+  }
+
   async function chop(block, token) {
     const axe = bot.inventory
       .items()
@@ -524,12 +540,33 @@ function initCommands(bot, mcData, defaultMove, deps) {
     if (axe && (!bot.heldItem || bot.heldItem.name !== axe.name)) {
       await bot.equip(axe, "hand").catch(() => {});
     }
-    if (!bot.canDigBlock(block)) {
-      const p = block.position;
-      const ok = await gotoTimeout(new goals.GoalNear(p.x, p.y, p.z, 3), 12000);
+    if (token !== ctx.token) return false;
+
+    let fresh = bot.blockAt(block.position);
+    if (!fresh || !isLogName(fresh.name)) return false;
+
+    // First navigate to a genuinely visible, reachable face. Pathfinder may
+    // dig leaves/soft foliage on the route and can tower if scaffold is in the
+    // inventory; merely being within three Euclidean blocks is not enough.
+    if (!bot.canDigBlock(fresh)) {
+      const ok = await gotoTimeout(logLookGoal(fresh.position), 30000);
       if (token !== ctx.token || !ok) return false;
     }
-    const fresh = bot.blockAt(block.position);
+
+    fresh = bot.blockAt(block.position);
+    if (!fresh || !isLogName(fresh.name)) return false;
+
+    // If the log is still outside reach, make one closer attempt. This also
+    // gives the 1x1 tower movement a chance to climb to high trunks when the
+    // bot has dirt/cobblestone (or another registered scaffold block).
+    if (!bot.canDigBlock(fresh)) {
+      const p = fresh.position;
+      const closerGoal = new goals.GoalNear(p.x, p.y, p.z, 1);
+      const ok = await gotoTimeout(closerGoal, 18000);
+      if (token !== ctx.token || !ok) return false;
+    }
+
+    fresh = bot.blockAt(block.position);
     if (!fresh || !isLogName(fresh.name) || !bot.canDigBlock(fresh)) return false;
     try {
       await bot.dig(fresh);
@@ -539,8 +576,21 @@ function initCommands(bot, mcData, defaultMove, deps) {
     }
   }
 
+  function countTowerBlocks() {
+    const ids = new Set((defaultMove && defaultMove.scafoldingBlocks) || []);
+    if (!ids.size || !bot.inventory) return 0;
+    return bot.inventory.items().reduce((total, item) => total + (ids.has(item.type) ? item.count : 0), 0);
+  }
+
   async function woodLoop(token, limit) {
+    const towerBlocks = countTowerBlocks();
+    if (towerBlocks === 0) {
+      say("No tower blocks in inventory. I can clear leaves, but I cannot pillar upward for high logs. Carry dirt, cobblestone, or planks.");
+    } else {
+      say("Tower blocks available: " + towerBlocks + ".");
+    }
     const blacklist = new Set();
+    const failures = new Map();
     let mined = 0;
     let reason = "";
     while (token === ctx.token) {
@@ -560,10 +610,14 @@ function initCommands(bot, mcData, defaultMove, deps) {
       const ok = await chop(pick.block, token);
       if (token !== ctx.token) return;
       if (ok) {
+        failures.delete(pick.key);
         mined++;
         await pickupDrops(token, 6);
       } else {
-        blacklist.add(pick.key);
+        const count = (failures.get(pick.key) || 0) + 1;
+        failures.set(pick.key, count);
+        if (count >= 3) blacklist.add(pick.key);
+        else await sleep(650); // let path recovery / foliage clearing settle before retry
       }
     }
     if (token === ctx.token) {

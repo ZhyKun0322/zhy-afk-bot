@@ -12,6 +12,104 @@ const express = require("express");
 const http = require("http");
 const https = require("https");
 
+// mineflayer-pathfinder 2.4.5 has an overhead-reach error in GoalLookAtBlock:
+// it measures from the bot's feet to the target block's raised center, then
+// raycasts from the eyes. That rejects reachable logs above the player. This
+// backport measures the actual eye-to-face distance before raycasting.
+function installGoalLookAtBlockReachFix() {
+  const proto = goals.GoalLookAtBlock && goals.GoalLookAtBlock.prototype;
+  if (!proto || proto.__overheadReachFix) return;
+
+  proto.isEnd = function (node) {
+    if (node.distanceTo(this.pos) > this.reach) return false;
+
+    const dx = node.x - (this.pos.x + 0.5);
+    const dy = node.y + this.entityHeight - (this.pos.y + 0.5);
+    const dz = node.z - (this.pos.z + 0.5);
+    const visibleFaces = {
+      y: Math.sign(Math.abs(dy) > 0.5 ? dy : 0),
+      x: Math.sign(Math.abs(dx) > 0.5 ? dx : 0),
+      z: Math.sign(Math.abs(dz) > 0.5 ? dz : 0),
+    };
+
+    for (const axis of ["y", "x", "z"]) {
+      const sign = visibleFaces[axis];
+      if (!sign) continue;
+      const targetPos = new Vec3(this.pos.x, this.pos.y, this.pos.z).offset(
+        0.5 + (axis === "x" ? sign * 0.5 : 0),
+        0.5 + (axis === "y" ? sign * 0.5 : 0),
+        0.5 + (axis === "z" ? sign * 0.5 : 0),
+      );
+      const startPos = new Vec3(node.x + 0.5, node.y + this.entityHeight, node.z + 0.5);
+      if (startPos.distanceTo(targetPos) > this.reach) continue;
+      const hit = this.world.raycast(
+        startPos,
+        targetPos.clone().subtract(startPos).normalize(),
+        this.reach,
+      );
+      const hitPos = hit && hit.position;
+      if (hitPos && hitPos.x === this.pos.x && hitPos.y === this.pos.y && hitPos.z === this.pos.z) {
+        return true;
+      }
+    }
+    return false;
+  };
+  proto.__overheadReachFix = true;
+}
+
+// The 2.4.5 executor tries to pillar-place as soon as the feet leave the
+// ground and waits for a slow head turn. On vanilla-like servers that often
+// means the block intersects the player's hitbox and is refused. Delay only
+// upward jump-pillar placements until the feet clear the proposed block, then
+// use Mineflayer's immediate-look placement helper when available.
+function installPillarPlacementFix(bot) {
+  if (!bot || bot.__pillarPlacementFix || typeof bot.placeBlock !== "function") return;
+  const originalPlaceBlock = bot.placeBlock.bind(bot);
+
+  function waitForFeetAbove(y, timeoutMs) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const finish = (error) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        bot.removeListener("physicsTick", check);
+        if (error) reject(error);
+        else resolve();
+      };
+      const check = () => {
+        if (!bot.entity) return finish(new Error("Bot entity disappeared during pillar jump"));
+        if (bot.entity.position.y > y + 2.1) return finish();
+      };
+      const timer = setTimeout(() => finish(new Error("Pillar jump did not clear the placement hitbox")), timeoutMs);
+      bot.on("physicsTick", check);
+      check();
+    });
+  }
+
+  bot.placeBlock = async function (referenceBlock, faceVector) {
+    const isVerticalPillar = Boolean(
+      this.pathfinder && typeof this.pathfinder.isBuilding === "function" &&
+      this.pathfinder.isBuilding() && this.controlState && this.controlState.jump &&
+      faceVector && faceVector.x === 0 && faceVector.y === 1 && faceVector.z === 0 &&
+      referenceBlock && referenceBlock.position,
+    );
+    if (!isVerticalPillar) return originalPlaceBlock(referenceBlock, faceVector);
+
+    await waitForFeetAbove(referenceBlock.position.y, 2400);
+    if (typeof this._placeBlockWithOptions === "function") {
+      return this._placeBlockWithOptions(referenceBlock, faceVector, {
+        swingArm: "right",
+        forceLook: true,
+      });
+    }
+    return originalPlaceBlock(referenceBlock, faceVector);
+  };
+  bot.__pillarPlacementFix = true;
+}
+
+installGoalLookAtBlockReachFix();
+
 // ============================================================
 // EXPRESS SERVER - Keep Render/Aternos alive
 // ============================================================
@@ -1523,15 +1621,105 @@ function createBot() {
       const mcData = require("minecraft-data")(bot.version);
       const defaultMove = new Movements(bot, mcData);
       defaultMove.allowFreeMotion = false;
-      defaultMove.canDig = false;
+      // Navigation must be able to clear ordinary terrain instead of pushing
+      // the bot against solid blocks. Protect valuable / dangerous blocks.
+      defaultMove.canDig = true;
+      // Prefer breaking cheap foliage/soft obstructions over repeatedly
+      // steering into them or making huge detours around dense tree canopies.
+      defaultMove.digCost = 0.75;
       defaultMove.liquidCost = 1000;
       defaultMove.fallDamageCost = 1000;
-      defaultMove.allow1by1towers = false;
+      defaultMove.allow1by1towers = true;
+      // Avoid parkour shortcuts in combat/tree canopies; they are a frequent
+      // source of corner collisions. Normal step-ups and scaffold towers remain.
+      defaultMove.allowParkour = false;
+      defaultMove.allowSprinting = false;
+      bot.pathfinder.thinkTimeout = 10000;
+      if (defaultMove.blocksCantBreak && mcData.blocksByName) {
+        const protectedNames = [
+          'bedrock','barrier','end_portal_frame','end_portal','nether_portal',
+          'chest','trapped_chest','ender_chest','barrel','shulker_box',
+          'spawner','trial_spawner','vault','beacon','enchanting_table',
+          'anvil','chipped_anvil','damaged_anvil','furnace','blast_furnace',
+          'smoker','brewing_stand','hopper','dispenser','dropper',
+          'diamond_ore','deepslate_diamond_ore','emerald_ore','deepslate_emerald_ore',
+          'ancient_debris','gold_ore','deepslate_gold_ore','iron_ore','deepslate_iron_ore',
+          'redstone_ore','deepslate_redstone_ore','lapis_ore','deepslate_lapis_ore',
+          'oak_log','spruce_log','birch_log','jungle_log','acacia_log','dark_oak_log',
+          'mangrove_log','cherry_log','crimson_stem','warped_stem',
+          'stripped_oak_log','stripped_spruce_log','stripped_birch_log','stripped_jungle_log',
+          'stripped_acacia_log','stripped_dark_oak_log','stripped_mangrove_log',
+          'stripped_cherry_log','stripped_crimson_stem','stripped_warped_stem'
+        ];
+        for (const name of protectedNames) {
+          const block = mcData.blocksByName[name];
+          if (block) defaultMove.blocksCantBreak.add(block.id);
+        }
+      }
+      // 1x1 towers only work if the bot has a supported scaffold block.
+      if (Array.isArray(defaultMove.scafoldingBlocks)) {
+        for (const name of [
+          'dirt','coarse_dirt','rooted_dirt','cobblestone','cobbled_deepslate',
+          'deepslate','polished_deepslate','netherrack','stone','andesite',
+          'stone_bricks','mossy_cobblestone','bricks',
+          'oak_planks','spruce_planks','birch_planks','jungle_planks',
+          'acacia_planks','dark_oak_planks','mangrove_planks','cherry_planks',
+          'crimson_planks','warped_planks'
+        ]) {
+          const item = mcData.itemsByName && mcData.itemsByName[name];
+          if (item && !defaultMove.scafoldingBlocks.includes(item.id)) defaultMove.scafoldingBlocks.push(item.id);
+        }
+      }
+      // Leaf blocks are safe to clear even next to water: they do not retain a
+      // fluid source. Some registry revisions misclassify them as unbreakable,
+      // and the generic anti-fluid-flow guard can otherwise block forest routes.
+      if (mcData.blocksArray && defaultMove.blocksCantBreak && defaultMove.blocksToAvoid) {
+        const leafIds = new Set();
+        for (const block of mcData.blocksArray) {
+          if (block.name && block.name.endsWith("_leaves")) {
+            leafIds.add(block.id);
+            defaultMove.blocksCantBreak.delete(block.id);
+            defaultMove.blocksToAvoid.delete(block.id);
+          }
+        }
+        if (leafIds.size && typeof defaultMove.safeToBreak === "function") {
+          const originalSafeToBreak = defaultMove.safeToBreak.bind(defaultMove);
+          defaultMove.safeToBreak = function (block) {
+            if (block && leafIds.has(block.type)) {
+              const oldDontCreateFlow = this.dontCreateFlow;
+              this.dontCreateFlow = false;
+              try { return originalSafeToBreak(block); }
+              finally { this.dontCreateFlow = oldDontCreateFlow; }
+            }
+            return originalSafeToBreak(block);
+          };
+        }
+        addLog(`[Pathfinder] Leaf clearing enabled for ${leafIds.size} leaf block types`);
+      }
       // Avoid sprinting through tight corners: laggy servers can make the
       // executor overshoot a one-block waypoint. Combat still sprints manually.
       defaultMove.allowSprinting = false;
+      addLog(`[Pathfinder] ${bot.version}: canDig=${defaultMove.canDig}, towers=${defaultMove.allow1by1towers}, scaffold=${(defaultMove.scafoldingBlocks || []).length}, sprint=${defaultMove.allowSprinting}`);
       configureDoorAwareMovements(bot, defaultMove);
       installPathfinderCollisionFixes(bot, defaultMove);
+      installPillarPlacementFix(bot);
+      addLog("[Pathfinder] Applied overhead block-reach and pillar-placement compatibility fixes");
+      let lastPathDiagnosticAt = 0;
+      bot.on("path_reset", (reason) => {
+        if (!["stuck", "no_scaffolding_blocks", "place_error", "dig_error"].includes(reason)) return;
+        const now = Date.now();
+        if (now - lastPathDiagnosticAt < 2500) return;
+        lastPathDiagnosticAt = now;
+        const pos = bot.entity && bot.entity.position;
+        addLog(`[Pathfinder] reset=${reason}${pos ? ` at ${pos.x.toFixed(1)},${pos.y.toFixed(1)},${pos.z.toFixed(1)}` : ""}`);
+      });
+      bot.on("path_update", (result) => {
+        if (!result || !["noPath", "timeout"].includes(result.status)) return;
+        const now = Date.now();
+        if (now - lastPathDiagnosticAt < 2500) return;
+        lastPathDiagnosticAt = now;
+        addLog(`[Pathfinder] search=${result.status}`);
+      });
 
       initializeModules(bot, mcData, defaultMove);
 

@@ -1,6 +1,7 @@
 "use strict";
 
 const { goals } = require("mineflayer-pathfinder");
+const { Vec3 } = require("vec3");
 
 // ============================================================
 // ENTITY HELPERS
@@ -201,6 +202,36 @@ function hasLineOfSight(bot, target) {
   }
 }
 
+// A clear eye-ray is not enough for melee: the bot can see over a slab or
+// fence while its feet are still blocked. Only use manual close-range steering
+// when the two-block walking corridor is clear. Otherwise leave movement to
+// the pathfinder so it can route around the obstruction.
+function hasClearMeleeLane(bot, target, maxDistance = 2.2) {
+  try {
+    if (!bot.entity || !target || !target.position || typeof bot.blockAt !== "function") return false;
+    const origin = bot.entity.position;
+    const dx = target.position.x - origin.x;
+    const dz = target.position.z - origin.z;
+    const horizontal = Math.hypot(dx, dz);
+    if (horizontal < 0.65) return true;
+    const ux = dx / horizontal;
+    const uz = dz / horizontal;
+    const limit = Math.min(maxDistance, horizontal - 0.35);
+    for (let d = 0.45; d <= limit; d += 0.3) {
+      for (const y of [0.1, 1.0]) {
+        const probe = origin.offset(ux * d, y, uz * d);
+        const block = bot.blockAt(probe, false);
+        // Unknown/unloaded space is not safe for direct steering.
+        if (!block) return false;
+        if (block.boundingBox === "block") return false;
+      }
+    }
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 // ============================================================
 // MOVEMENT HELPERS
 // ============================================================
@@ -245,6 +276,8 @@ function createNav(bot) {
   let escapeInProgress = false;
   let recoverySwappingGoal = false;
   let cancelGoalPromise = null;
+  let lastProgressPosition = null;
+  let lastProgressAt = Date.now();
 
   function followGoal(entity, range) {
     return new goals.GoalFollow(entity, range);
@@ -252,12 +285,46 @@ function createNav(bot) {
 
   function setActiveGoal(goal, dynamic = false) {
     activeGoal = { goal, dynamic };
+    lastProgressPosition = bot.entity && bot.entity.position ? bot.entity.position.clone() : null;
+    lastProgressAt = Date.now();
     bot.pathfinder.setGoal(goal, dynamic);
   }
 
-  // The pathfinder emits path_reset('stuck') after a node cannot be reached.
-  // Reissuing the identical route from the identical position is not enough:
-  // briefly move off-axis, then calculate a fresh path from the new position.
+  function isClearBodyBlock(block) {
+    return Boolean(block && (block.boundingBox === "empty" || (Array.isArray(block.shapes) && block.shapes.length === 0)));
+  }
+
+  function findSafeEscapeTile(goal) {
+    const p = bot.entity.position.floored();
+    const dirs = [
+      { x: 1, z: 0 }, { x: -1, z: 0 },
+      { x: 0, z: 1 }, { x: 0, z: -1 },
+    ];
+    const target = goal && Number.isFinite(goal.x) && Number.isFinite(goal.z) ? goal : null;
+    const candidates = [];
+    for (const dir of dirs) {
+      const feetPos = p.offset(dir.x, 0, dir.z);
+      const feet = bot.blockAt(feetPos, false);
+      const head = bot.blockAt(feetPos.offset(0, 1, 0), false);
+      const floor = bot.blockAt(feetPos.offset(0, -1, 0), false);
+      const floorHeight = floor && Array.isArray(floor.shapes)
+        ? floor.shapes.reduce((height, shape) => Math.max(height, shape[4] || 0), 0)
+        : 0;
+      if (!isClearBodyBlock(feet) || !isClearBodyBlock(head)) continue;
+      if (!floor || floor.boundingBox !== "block" || floorHeight < 0.5) continue;
+      if (feet.name === "lava" || feet.name === "fire" || head.name === "lava" || head.name === "fire") continue;
+      const score = target
+        ? Math.pow(feetPos.x + 0.5 - (target.x + 0.5), 2) + Math.pow(feetPos.z + 0.5 - (target.z + 0.5), 2)
+        : Math.random();
+      candidates.push({ pos: feetPos, score });
+    }
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates[0] ? candidates[0].pos : null;
+  }
+
+  // On a real stall, move toward a block-checked adjacent tile rather than
+  // blindly pressing in a randomly rotated direction (which can drive the bot
+  // straight into another wall or off an edge). Then rebuild the original goal.
   function escapeBlockedNode() {
     const now = Date.now();
     if (escapeInProgress || !activeGoal || !bot.entity || now - lastEscapeAt < 1800) return;
@@ -266,59 +333,54 @@ function createNav(bot) {
     escapeInProgress = true;
     lastEscapeAt = now;
     escapeCount++;
-    const direction = escapeCount % 2 === 0 ? 1 : -1;
     const goalSnapshot = activeGoal;
-    const yaw = Number.isFinite(bot.entity.yaw) ? bot.entity.yaw : 0;
-    const pitch = Number.isFinite(bot.entity.pitch) ? bot.entity.pitch : 0;
+    const escapeTile = findSafeEscapeTile(goalSnapshot.goal);
+
+    const restoreGoal = () => {
+      try {
+        if (activeGoal === goalSnapshot && bot.entity) {
+          if (goalSnapshot.goal && goalSnapshot.goal.entity && !goalSnapshot.goal.entity.position) {
+            activeGoal = null;
+            key = null;
+          } else {
+            lastProgressPosition = bot.entity.position.clone();
+            lastProgressAt = Date.now();
+            bot.pathfinder.setGoal(goalSnapshot.goal, goalSnapshot.dynamic);
+          }
+        }
+      } catch (e) {
+        key = null;
+      }
+      recoverySwappingGoal = false;
+      escapeInProgress = false;
+    };
 
     try {
       recoverySwappingGoal = true;
       bot.pathfinder.setGoal(null);
       bot.clearControlStates();
-      // Turn 90 degrees and make a short jump-step away from the collision.
-      // This avoids repeatedly steering into the exact same face/corner.
-      Promise.resolve(bot.look(yaw + direction * Math.PI / 2, pitch, true))
+      if (!escapeTile) {
+        // No adjacent safe floor is known (for example, a ledge or unloaded
+        // chunk). Do not blindly walk into unknown space; just replan once.
+        setTimeout(restoreGoal, 350);
+        return;
+      }
+      const dx = escapeTile.x + 0.5 - bot.entity.position.x;
+      const dz = escapeTile.z + 0.5 - bot.entity.position.z;
+      const escapeYaw = Math.atan2(-dx, -dz);
+      Promise.resolve(bot.look(escapeYaw, 0, true))
         .catch(() => {})
         .finally(() => {
-          if (!bot.entity) {
-            escapeInProgress = false;
-            return;
-          }
-          try {
-            bot.setControlState("forward", true);
-            bot.setControlState("jump", true);
-          } catch (e) {}
-
+          if (!bot.entity) return restoreGoal();
+          bot.setControlState("forward", true);
+          bot.setControlState("sprint", false);
           setTimeout(() => {
-            try {
-              bot.setControlState("forward", false);
-              bot.setControlState("jump", false);
-              bot.setControlState("left", false);
-              bot.setControlState("right", false);
-              bot.setControlState("sprint", false);
-            } catch (e) {}
-
-            // If another command replaced navigation while escaping, don't
-            // restore the previous command's goal over the new one.
-            if (activeGoal === goalSnapshot && bot.entity) {
-              try {
-                if (goalSnapshot.goal && goalSnapshot.goal.entity && !goalSnapshot.goal.entity.position) {
-                  activeGoal = null;
-                  key = null;
-                } else {
-                  bot.pathfinder.setGoal(goalSnapshot.goal, goalSnapshot.dynamic);
-                }
-              } catch (e) {
-                key = null;
-              }
-            }
-            recoverySwappingGoal = false;
-            escapeInProgress = false;
-          }, 320);
+            try { bot.setControlState("forward", false); } catch (e) {}
+            restoreGoal();
+          }, 300);
         });
     } catch (e) {
-      recoverySwappingGoal = false;
-      escapeInProgress = false;
+      restoreGoal();
       key = null;
     }
   }
@@ -326,8 +388,32 @@ function createNav(bot) {
   const onPathReset = (reason) => {
     if (reason === "stuck") escapeBlockedNode();
   };
+  const onPhysicsTick = () => {
+    if (!bot.entity || !activeGoal || !bot.pathfinder.goal || escapeInProgress) return;
+    if (bot.pathfinder.isMining() || bot.pathfinder.isBuilding()) return;
+    let moving = false;
+    try { moving = bot.pathfinder.isMoving(); } catch (e) {}
+    if (!moving) {
+      lastProgressPosition = bot.entity.position.clone();
+      lastProgressAt = Date.now();
+      return;
+    }
+    const now = Date.now();
+    if (!lastProgressPosition || bot.entity.position.distanceTo(lastProgressPosition) > 0.14) {
+      lastProgressPosition = bot.entity.position.clone();
+      lastProgressAt = now;
+      return;
+    }
+    // Some collision stalls do not emit path_reset('stuck') promptly. Detect
+    // a live goal with no physical displacement and trigger the same recovery.
+    if (now - lastProgressAt > 2400) escapeBlockedNode();
+  };
   bot.on("path_reset", onPathReset);
-  bot.once("end", () => bot.removeListener("path_reset", onPathReset));
+  bot.on("physicsTick", onPhysicsTick);
+  bot.once("end", () => {
+    bot.removeListener("path_reset", onPathReset);
+    bot.removeListener("physicsTick", onPhysicsTick);
+  });
 
   return {
     follow(entity, range = 2) {
@@ -359,6 +445,8 @@ function createNav(bot) {
       escapeInProgress = false;
       const goalState = { goal, dynamic: false };
       activeGoal = goalState;
+      lastProgressPosition = bot.entity && bot.entity.position ? bot.entity.position.clone() : null;
+      lastProgressAt = Date.now();
 
       return new Promise((resolve, reject) => {
         let settled = false;
@@ -411,6 +499,7 @@ function createNav(bot) {
       activeGoal = null;
       escapeInProgress = false;
       recoverySwappingGoal = false;
+      lastProgressPosition = null;
       bot.pathfinder.setGoal(null);
     },
     forget() {
@@ -420,6 +509,7 @@ function createNav(bot) {
       activeGoal = null;
       escapeInProgress = false;
       recoverySwappingGoal = false;
+      lastProgressPosition = null;
     },
   };
 }
@@ -485,7 +575,10 @@ function createMelee(bot, nav) {
     const dy = target.position.y - bot.entity.position.y;
     lookAtPoint(bot, target.position.offset(0, (target.height || 1.8) * 0.6, 0));
 
-    const useManual = manual ? d < 5.0 && Math.abs(dy) < 2 : d < 3.8 && Math.abs(dy) < 1.5;
+    const visible = hasLineOfSight(bot, target);
+    const laneClear = hasClearMeleeLane(bot, target);
+    const useManual = visible && laneClear &&
+      (manual ? d < 5.0 && Math.abs(dy) < 2 : d < 3.8 && Math.abs(dy) < 1.5);
     const cd = cooldownMs(bot.heldItem);
     const chargedIn = Math.max(0, lastAttack + cd + 30 - now);
     const inReach = d <= reach - 0.05;
@@ -560,6 +653,7 @@ module.exports = {
   computeAim,
   createVelocityTracker,
   hasLineOfSight,
+  hasClearMeleeLane,
   setCtl,
   look,
   lookAtPoint,
