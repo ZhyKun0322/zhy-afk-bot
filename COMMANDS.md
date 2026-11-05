@@ -6,7 +6,8 @@ Type these in Minecraft chat. Bedrock (Geyser) players work too - the "." in fro
 |---|---|
 | `!wood [n]` | Chops nearby trees and picks up the logs. Optional `n` = stop after n logs. Type again to stop. |
 | `!follow` | Follows whoever typed it. Type again to stop. |
-| `!kill` | Hunts pigs, cows, sheep and chickens (100 block radius) and picks up the drops. Type again to stop. |
+| `!kill` | Hunts configured passive animals and recognized hostile mobs, then picks up drops. It keeps scanning when no target is currently tracked; type again to stop. |
+| `!killstatus` | Shows the current kill target, distance, visible eligible mobs, and confirmed kill count. |
 | `!radius` | Saves the bot's current spot as its fixed position. It stays there and walks back when pushed away. |
 | `!unsave` | Clears the fixed position. |
 | `!guard` | Follows you and kills hostile mobs within 10 blocks of you. |

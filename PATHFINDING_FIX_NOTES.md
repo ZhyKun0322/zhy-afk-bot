@@ -70,3 +70,10 @@ This build responds to the supplied screenshot of the bot stopped beside a villa
 - Mining/building state is no longer an unconditional blind spot for recovery. If a dig or scaffold operation stays active without progress for 12 seconds, the controller cancels the stalled action and retries the task goal. Mineflayer documents `bot.stopDigging()` as the supported way to interrupt an in-progress dig.
 - Removed the obsolete timed leave/rejoin behavior from the compatibility module. It was not imported by `index.js`, but is now harmless if another entry point uses it.
 - The normal and woodcutting movement profiles are now separate. This protects village structures during follow/combat and confines digging/towering to woodcutting.
+
+
+# Kill targeting update v8
+- `!kill` now targets configured passive animals plus recognized hostile mobs from the combat helper's safe hostile list.
+- Empty scans no longer stop kill mode after ~3 seconds; the bot keeps scanning while the command remains enabled and reports when no eligible entity is currently tracked.
+- A target disappearing from `bot.entities` is treated as despawn/untracking, not a confirmed kill. Only `entityDead` increments the kill counter and starts drop pickup.
+- Added `!killstatus` to report the current target, distance, eligible tracked-entity count/names, and confirmed kills.

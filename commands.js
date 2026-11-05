@@ -148,7 +148,16 @@ function initCommands(bot, mcData, defaultMove, deps) {
   });
 
   // ---------- mode bookkeeping ----------
-  const killState = { target: null, lastScan: 0, emptyScans: 0, kills: 0 };
+  const killState = {
+    target: null,
+    lastScan: 0,
+    emptyScans: 0,
+    kills: 0,
+    lastEmptyNotice: 0,
+    lastVisibleCount: 0,
+    lastVisibleNames: [],
+    lastLostTarget: null,
+  };
   let lostWarnAt = 0;
 
   const pvp = createPvp(bot, {
@@ -387,6 +396,11 @@ function initCommands(bot, mcData, defaultMove, deps) {
     killState.target = null;
     killState.emptyScans = 0;
     killState.kills = 0;
+    killState.lastScan = 0;
+    killState.lastEmptyNotice = 0;
+    killState.lastVisibleCount = 0;
+    killState.lastVisibleNames = [];
+    killState.lastLostTarget = null;
     // anti-AFK keeps the bot sneaking - that would cripple every mode below
     try {
       bot.setControlState("sneak", false);
@@ -634,56 +648,98 @@ function initCommands(bot, mcData, defaultMove, deps) {
   }
 
   // ============================================================
-  // !kill  (pig, cow, sheep, chicken)
+  // !kill: hunt configured passive animals and recognized hostiles.
+  // Keep scanning while enabled; an empty scan is not a reason to stop.
   // ============================================================
-  function nearestAnimal() {
+  function isKillCandidate(entity) {
+    return !!(
+      entity && entity.position && entity !== bot.entity &&
+      (cfg.kill.animals.includes(entity.name) || U.isHostile(entity))
+    );
+  }
+
+  function nearestKillTarget() {
     let best = null;
-    let bd = Infinity;
-    for (const e of Object.values(bot.entities)) {
-      if (!e.position || e === bot.entity || !cfg.kill.animals.includes(e.name)) continue;
-      const d = bot.entity.position.distanceTo(e.position);
-      if (d <= cfg.kill.radius && d < bd) {
-        bd = d;
-        best = e;
+    let bestDistance = Infinity;
+    let count = 0;
+    const names = new Set();
+    for (const entity of Object.values(bot.entities)) {
+      if (!isKillCandidate(entity)) continue;
+      const distance = bot.entity.position.distanceTo(entity.position);
+      if (distance > cfg.kill.radius) continue;
+      count++;
+      names.add(entity.name);
+      if (distance < bestDistance) {
+        bestDistance = distance;
+        best = entity;
       }
     }
+    killState.lastVisibleCount = count;
+    killState.lastVisibleNames = [...names].slice(0, 8);
     return best;
   }
 
-  function killTarget(target) {
+  function killConfirmedTarget(target) {
+    // Only entityDead confirms a kill. Disappearing from the local entity map
+    // can also mean despawn/unload and must not inflate the kill count.
+    if (!target || !killState.target || target.id !== killState.target.id) return;
     const token = ctx.token;
     killState.target = null;
     killState.kills++;
+    killState.lastLostTarget = null;
     ctx.pickup = true;
+    melee.release();
+    nav.stop();
     pickupDrops(token, 8).then(() => {
       if (token === ctx.token) ctx.pickup = false;
+    }).catch((e) => {
+      if (token === ctx.token) ctx.pickup = false;
+      log("drop pickup after kill failed: " + e.message);
     });
   }
 
   function killTick() {
     if (ctx.pickup) return;
     const now = Date.now();
-    let t = killState.target;
-    if (t && !bot.entities[t.id]) {
-      killTarget(t);
-      return;
+    let target = killState.target;
+
+    // A target can disappear because it despawned or left entity-tracking
+    // range. Clear it and scan again; do NOT count it as a kill or chase its
+    // stale last-known position.
+    if (target && (!bot.entities[target.id] || !target.position)) {
+      killState.lastLostTarget = target.name || "unknown";
+      log("kill target lost/untracked (not counted as a kill): " + killState.lastLostTarget);
+      killState.target = null;
+      target = null;
+      melee.release();
+      nav.stop();
     }
-    if (!t) {
-      if (now - killState.lastScan < 500) return;
+
+    if (!target) {
+      if (now - killState.lastScan < 700) return;
       killState.lastScan = now;
-      t = nearestAnimal();
-      if (!t) {
+      target = nearestKillTarget();
+      if (!target) {
         killState.emptyScans++;
-        if (killState.emptyScans >= 6) {
-          say("No more animals in range. Killed " + killState.kills + ".");
-          stopMode(false);
+        // Stay in kill mode. Entities may enter tracking range later; the
+        // former six-scan auto-stop made !kill silently quit after ~3 seconds.
+        if (now - killState.lastEmptyNotice > 15000) {
+          killState.lastEmptyNotice = now;
+          const seen = killState.lastVisibleNames.length
+            ? " Eligible nearby: " + killState.lastVisibleNames.join(", ") + "."
+            : " No eligible animals/hostile mobs are currently tracked nearby.";
+          say("Still hunting; no target is currently available. Move closer to loaded mobs or wait for one to spawn. Kills: " + killState.kills + "." + seen);
+          log("kill scan empty; continuing to scan loaded entities within " + cfg.kill.radius + " blocks.");
         }
         return;
       }
       killState.emptyScans = 0;
-      killState.target = t;
+      killState.target = target;
+      say("Targeting " + target.name + ".");
+      log("kill target acquired: " + target.name + " (entity " + target.id + ").");
     }
-    melee.step(t, { crit: false, prefer: "sword" });
+
+    melee.step(target, { crit: false, prefer: "sword" });
   }
 
   // ============================================================
@@ -761,7 +817,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
   bot.on("entityDead", (entity) => {
     if (ctx.mode === "pvp") pvp.onEntityDead(entity);
     if (ctx.mode === "kill" && killState.target && entity && entity.id === killState.target.id) {
-      killTarget(entity);
+      killConfirmedTarget(entity);
     }
   });
 
@@ -784,7 +840,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
   function run(name, args, username) {
     switch (name) {
       case "help":
-        say("!wood [n] !follow !kill !guard !unguard !pvp [name] !sleep !armor !inventory !pathstatus !radius !unsave !stop");
+        say("!wood [n] !follow !kill !killstatus !guard !unguard !pvp [name] !sleep !armor !inventory !pathstatus !radius !unsave !stop");
         return;
 
       case "stop":
@@ -905,8 +961,25 @@ function initCommands(bot, mcData, defaultMove, deps) {
           return;
         }
         startMode("kill", username);
-        say("Hunting pigs, cows, sheep and chickens within " + cfg.kill.radius + " blocks.");
+        say("Hunting configured animals and hostile mobs within " + cfg.kill.radius + " blocks. I'll keep scanning until you type !kill again.");
         return;
+
+      case "killstatus": {
+        const target = killState.target;
+        const distance = target && target.position && bot.entity
+          ? bot.entity.position.distanceTo(target.position).toFixed(1) + " blocks"
+          : "n/a";
+        const details = "mode=" + ctx.mode +
+          ", target=" + (target && bot.entities[target.id] ? target.name : "none") +
+          ", distance=" + distance +
+          ", visibleEligible=" + killState.lastVisibleCount +
+          (killState.lastVisibleNames.length ? " [" + killState.lastVisibleNames.join(",") + "]" : "") +
+          ", kills=" + killState.kills +
+          (killState.lastLostTarget ? ", lastLost=" + killState.lastLostTarget : "");
+        log("killstatus: " + details);
+        say("Kill status: " + details);
+        return;
+      }
 
       case "guard":
         if (!playerEntity(username)) {
