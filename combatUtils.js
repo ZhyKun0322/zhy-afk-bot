@@ -278,6 +278,7 @@ function createNav(bot) {
   let cancelGoalPromise = null;
   let lastProgressPosition = null;
   let lastProgressAt = Date.now();
+  let missingGoalSince = 0;
 
   function followGoal(entity, range) {
     return new goals.GoalFollow(entity, range);
@@ -287,6 +288,7 @@ function createNav(bot) {
     activeGoal = { goal, dynamic };
     lastProgressPosition = bot.entity && bot.entity.position ? bot.entity.position.clone() : null;
     lastProgressAt = Date.now();
+    missingGoalSince = 0;
     bot.pathfinder.setGoal(goal, dynamic);
   }
 
@@ -468,32 +470,73 @@ function createNav(bot) {
   }
 
   const onPathReset = (reason) => {
-    if (reason === "stuck") escapeBlockedNode();
+    // `stuck` is the normal movement failure; digging/placing failures can
+    // leave the same active goal stranded and deserve the same recovery path.
+    if (["stuck", "dig_error", "place_error", "no_scaffolding_blocks"].includes(reason)) {
+      escapeBlockedNode();
+    }
+  };
+  const onPathUpdate = (result) => {
+    // noPath/timeout are path_update statuses, NOT path_reset reasons. v5 did
+    // not listen for these, so follow/PvP could silently keep a dead goal key.
+    if (!result || !["noPath", "timeout"].includes(result.status)) return;
+    if (!escapeInProgress) escapeBlockedNode();
   };
   const onPhysicsTick = () => {
-    if (!bot.entity || !activeGoal || !bot.pathfinder.goal || escapeInProgress) return;
+    if (!bot.entity || !activeGoal || escapeInProgress) return;
     if (bot.pathfinder.isMining() || bot.pathfinder.isBuilding()) return;
-    let moving = false;
-    try { moving = bot.pathfinder.isMoving(); } catch (e) {}
-    if (!moving) {
+
+    const now = Date.now();
+    // A dynamic GoalFollow remains active when its target is in range. Static
+    // goals can also complete on this tick, so don't mistake arrival for a jam.
+    let reached = false;
+    try {
+      reached = !!(activeGoal.goal && typeof activeGoal.goal.isEnd === "function" &&
+        activeGoal.goal.isEnd(bot.entity.position.floored()));
+    } catch (e) {}
+    if (reached) {
       lastProgressPosition = bot.entity.position.clone();
-      lastProgressAt = Date.now();
+      lastProgressAt = now;
+      missingGoalSince = 0;
       return;
     }
-    const now = Date.now();
-    if (!lastProgressPosition || bot.entity.position.distanceTo(lastProgressPosition) > 0.14) {
+
+    // The library can clear its goal after a failed search. Since nav.follow()
+    // intentionally de-duplicates identical goals, it would otherwise never
+    // submit the target again. Re-arm the original active goal after a grace
+    // period (unless recovery currently owns the pathfinder).
+    if (!bot.pathfinder.goal) {
+      if (!missingGoalSince) missingGoalSince = now;
+      if (now - missingGoalSince > 900) {
+        missingGoalSince = now;
+        try {
+          console.warn("[Pathfinder] Active task lost its pathfinder goal; restoring it.");
+          bot.pathfinder.setGoal(activeGoal.goal, activeGoal.dynamic);
+        } catch (e) {}
+      }
+      return;
+    }
+    missingGoalSince = 0;
+
+    // Detect lack of actual body displacement whether isMoving() says true or
+    // false. In v5, the !isMoving branch refreshed the timer every tick, so a
+    // route that had stopped without clearing its goal could never time out.
+    const moved = lastProgressPosition
+      ? bot.entity.position.distanceTo(lastProgressPosition)
+      : Infinity;
+    if (moved > 0.08) {
       lastProgressPosition = bot.entity.position.clone();
       lastProgressAt = now;
       return;
     }
-    // Some collision stalls do not emit path_reset('stuck') promptly. Detect
-    // a live goal with no physical displacement and trigger the same recovery.
-    if (now - lastProgressAt > 2400) escapeBlockedNode();
+    if (now - lastProgressAt > 3200) escapeBlockedNode();
   };
   bot.on("path_reset", onPathReset);
+  bot.on("path_update", onPathUpdate);
   bot.on("physicsTick", onPhysicsTick);
   bot.once("end", () => {
     bot.removeListener("path_reset", onPathReset);
+    bot.removeListener("path_update", onPathUpdate);
     bot.removeListener("physicsTick", onPhysicsTick);
   });
 
@@ -550,9 +593,12 @@ function createNav(bot) {
           if (reachedGoal === goal) finish();
         };
         const onPathUpdate = (result) => {
-          if (!result) return;
-          if (result.status === "noPath") finish(new Error("No path to the goal"));
-          else if (result.status === "timeout") finish(new Error("Pathfinding timed out"));
+          if (!result || !["noPath", "timeout"].includes(result.status)) return;
+          // The createNav-level listener runs first and starts a temporary
+          // escape goal. Keep this promise alive while that recovery is active;
+          // otherwise wood/drop routes cancel their own recovery immediately.
+          if (escapeInProgress || recoverySwappingGoal) return;
+          finish(new Error(result.status === "noPath" ? "No path to the goal" : "Pathfinding timed out"));
         };
         const onGoalUpdated = (nextGoal) => {
           if (recoverySwappingGoal) return;
@@ -668,7 +714,9 @@ function createMelee(bot, nav) {
     if (!useManual) {
       if (manual) release();
       nav.follow(target, 2);
-      if (inReach && chargedIn === 0) hit(target);
+      // Do not swing through a wall/leaf/fence merely because Euclidean
+      // reach is short. Wait until the walking lane and sightline are clear.
+      if (visible && laneClear && inReach && chargedIn === 0) hit(target);
       return;
     }
 

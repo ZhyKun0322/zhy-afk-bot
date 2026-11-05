@@ -1373,8 +1373,24 @@ function installPathfinderCollisionFixes(bot, movements) {
   if (typeof movements.getMoveDiagonal === "function" && !movements.__safeDiagonalPatch) {
     const originalDiagonal = movements.getMoveDiagonal;
     movements.getMoveDiagonal = function (node, dir, neighbors) {
-      const diagonalLanding = this.getBlock(node, dir.x, 0, dir.z);
-      if (diagonalLanding && diagonalLanding.physical) return;
+      // Backport upstream mineflayer-pathfinder PR #393. A diagonal is only
+      // valid when BOTH cardinal side corridors are clear for the full body.
+      // Checking only the diagonal landing block still lets the 0.6-block
+      // player hitbox clip a wall/tree corner during execution.
+      const landing = this.getBlock(node, dir.x, 0, dir.z);
+      const y = landing && landing.physical ? 1 : 0;
+
+      // Raised diagonal landings are especially likely to clip a corner. The
+      // pathfinder will consider the two safer cardinal jump options instead.
+      if (y === 1) return;
+
+      const side1Head = this.getBlock(node, 0, y + 1, dir.z);
+      const side1Body = this.getBlock(node, 0, y, dir.z);
+      const side2Head = this.getBlock(node, dir.x, y + 1, 0);
+      const side2Body = this.getBlock(node, dir.x, y, 0);
+      if (!side1Head || !side1Body || !side2Head || !side2Body) return;
+      if (!side1Head.safe || !side1Body.safe || !side2Head.safe || !side2Body.safe) return;
+
       return originalDiagonal.call(this, node, dir, neighbors);
     };
     movements.__safeDiagonalPatch = true;
