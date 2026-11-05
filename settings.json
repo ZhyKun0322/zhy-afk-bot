@@ -1,12 +1,12 @@
 {
-  "name": "ZhyBot",
+  "name": "AFK Bot",
   "bot-account": {
-    "username": "ZhyBot",
+    "username": "SoloCloudHosting",
     "password": "",
     "type": "offline"
   },
   "server": {
-    "ip": "tempestcraft.mcsh.gg",
+    "ip": "solocloud.host",
     "port": 25565,
     "version": "1.20.1",
     "try-creative": false

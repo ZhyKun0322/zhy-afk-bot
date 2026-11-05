@@ -294,95 +294,177 @@ function createNav(bot) {
     return Boolean(block && (block.boundingBox === "empty" || (Array.isArray(block.shapes) && block.shapes.length === 0)));
   }
 
-  function findSafeEscapeTile(goal) {
-    const p = bot.entity.position.floored();
-    const dirs = [
-      { x: 1, z: 0 }, { x: -1, z: 0 },
-      { x: 0, z: 1 }, { x: 0, z: -1 },
-    ];
-    const target = goal && Number.isFinite(goal.x) && Number.isFinite(goal.z) ? goal : null;
-    const candidates = [];
-    for (const dir of dirs) {
-      const feetPos = p.offset(dir.x, 0, dir.z);
-      const feet = bot.blockAt(feetPos, false);
-      const head = bot.blockAt(feetPos.offset(0, 1, 0), false);
-      const floor = bot.blockAt(feetPos.offset(0, -1, 0), false);
-      const floorHeight = floor && Array.isArray(floor.shapes)
-        ? floor.shapes.reduce((height, shape) => Math.max(height, shape[4] || 0), 0)
-        : 0;
-      if (!isClearBodyBlock(feet) || !isClearBodyBlock(head)) continue;
-      if (!floor || floor.boundingBox !== "block" || floorHeight < 0.5) continue;
-      if (feet.name === "lava" || feet.name === "fire" || head.name === "lava" || head.name === "fire") continue;
-      const score = target
-        ? Math.pow(feetPos.x + 0.5 - (target.x + 0.5), 2) + Math.pow(feetPos.z + 0.5 - (target.z + 0.5), 2)
-        : Math.random();
-      candidates.push({ pos: feetPos, score });
-    }
-    candidates.sort((a, b) => a.score - b.score);
-    return candidates[0] ? candidates[0].pos : null;
+  function hasSafeFloor(block) {
+    if (!block || !block.shapes || block.shapes.length === 0) return false;
+    // Accept full blocks and high partial surfaces, but reject thin carpets/slabs
+    // that are not a dependable landing surface for this escape routine.
+    return block.shapes.some((shape) => Number(shape[4]) >= 0.7);
   }
 
-  // On a real stall, move toward a block-checked adjacent tile rather than
-  // blindly pressing in a randomly rotated direction (which can drive the bot
-  // straight into another wall or off an edge). Then rebuild the original goal.
+  function hasTowerBlocks() {
+    const movements = bot.pathfinder && bot.pathfinder.movements;
+    if (movements && typeof movements.countScaffoldingItems === "function") {
+      try { return movements.countScaffoldingItems() > 0; } catch (e) {}
+    }
+    return false;
+  }
+
+  function targetPosition(goal) {
+    if (!goal) return null;
+    if (goal.entity && goal.entity.position) return goal.entity.position;
+    if (goal.pos) return goal.pos;
+    if (Number.isFinite(goal.x) && Number.isFinite(goal.y) && Number.isFinite(goal.z)) {
+      return { x: goal.x, y: goal.y, z: goal.z };
+    }
+    return null;
+  }
+
+  // Search in 3D, not just the four same-height neighbors. A bot in a trench
+  // needs to find a one-block-higher ledge; a same-level-only search reports
+  // no escape even when the top of the dirt wall is immediately beside it.
+  function findSafeEscapeTiles(goal) {
+    const p = bot.entity.position.floored();
+    const target = targetPosition(goal);
+    const canTower = hasTowerBlocks();
+    const candidates = [];
+    const bodyHeight = bot.entity.height || 1.8;
+    const bodyBlocks = Math.max(2, Math.ceil(bodyHeight));
+
+    for (let dx = -3; dx <= 3; dx++) {
+      for (let dz = -3; dz <= 3; dz++) {
+        if (dx === 0 && dz === 0) continue;
+        const horizontalDistance = Math.hypot(dx, dz);
+        if (horizontalDistance > 3.25) continue;
+        for (let dy = -2; dy <= 2; dy++) {
+          const feetPos = p.offset(dx, dy, dz);
+          const feet = bot.blockAt(feetPos, false);
+          if (!isClearBodyBlock(feet)) continue;
+
+          let bodyClear = true;
+          for (let h = 1; h < bodyBlocks; h++) {
+            const bodyBlock = bot.blockAt(feetPos.offset(0, h, 0), false);
+            if (!isClearBodyBlock(bodyBlock)) { bodyClear = false; break; }
+          }
+          if (!bodyClear) continue;
+
+          const hazardNames = new Set(["lava", "flowing_lava", "fire", "soul_fire", "cactus", "magma_block"]);
+          if (hazardNames.has(feet.name)) continue;
+
+          const floor = bot.blockAt(feetPos.offset(0, -1, 0), false);
+          const supported = hasSafeFloor(floor);
+          // Let the pathfinder plan a scaffold move to an elevated escape
+          // waypoint when it has blocks; do not simulate a fake floor here.
+          const towerable = canTower && dy > 0;
+          if (!supported && !towerable) continue;
+
+          const targetDistance = target
+            ? Math.hypot(feetPos.x + 0.5 - target.x, feetPos.y - target.y, feetPos.z + 0.5 - target.z)
+            : 0;
+          const currentTargetDistance = target
+            ? Math.hypot(bot.entity.position.x - target.x, bot.entity.position.y - target.y, bot.entity.position.z - target.z)
+            : 0;
+          const progressPenalty = target ? (targetDistance - currentTargetDistance) * 1.5 : 0;
+          const verticalPenalty = dy > 0 ? dy * 0.9 : Math.abs(dy) * 0.7;
+          const score = horizontalDistance + verticalPenalty + progressPenalty;
+          candidates.push({ pos: feetPos, score, supported, towerable });
+        }
+      }
+    }
+    candidates.sort((a, b) => a.score - b.score);
+    return candidates;
+  }
+
   function escapeBlockedNode() {
     const now = Date.now();
-    if (escapeInProgress || !activeGoal || !bot.entity || now - lastEscapeAt < 1800) return;
+    if (escapeInProgress || !activeGoal || !bot.entity || now - lastEscapeAt < 5000) return;
     if (bot.pathfinder.isMining() || bot.pathfinder.isBuilding()) return;
 
+    const goalSnapshot = activeGoal;
+    const candidates = findSafeEscapeTiles(goalSnapshot.goal);
+    if (!candidates.length) {
+      lastEscapeAt = now;
+      console.warn("[Pathfinder] Stuck recovery found no safe 3D escape tile; keeping the original goal and waiting for a new world/path update.");
+      try { bot.pathfinder.setGoal(goalSnapshot.goal, goalSnapshot.dynamic); } catch (e) {}
+      return;
+    }
+
     escapeInProgress = true;
+    recoverySwappingGoal = true;
     lastEscapeAt = now;
     escapeCount++;
-    const goalSnapshot = activeGoal;
-    const escapeTile = findSafeEscapeTile(goalSnapshot.goal);
+    try {
+      bot.pathfinder.setGoal(null);
+      bot.clearControlStates();
+    } catch (e) {
+      recoverySwappingGoal = false;
+      escapeInProgress = false;
+      return;
+    }
 
-    const restoreGoal = () => {
-      try {
-        if (activeGoal === goalSnapshot && bot.entity) {
-          if (goalSnapshot.goal && goalSnapshot.goal.entity && !goalSnapshot.goal.entity.position) {
-            activeGoal = null;
-            key = null;
-          } else {
-            lastProgressPosition = bot.entity.position.clone();
-            lastProgressAt = Date.now();
-            bot.pathfinder.setGoal(goalSnapshot.goal, goalSnapshot.dynamic);
-          }
+    let candidateIndex = 0;
+    let attemptTimer = null;
+    let activeEscapeGoal = null;
+    let listeners = null;
+    const finishRecovery = (restoreOriginal) => {
+      if (attemptTimer) clearTimeout(attemptTimer);
+      if (listeners) {
+        bot.removeListener("goal_reached", listeners.onReached);
+        bot.removeListener("path_update", listeners.onPathUpdate);
+      }
+      listeners = null;
+      activeEscapeGoal = null;
+      if (restoreOriginal && activeGoal === goalSnapshot && bot.entity) {
+        try {
+          lastProgressPosition = bot.entity.position.clone();
+          lastProgressAt = Date.now();
+          bot.pathfinder.setGoal(goalSnapshot.goal, goalSnapshot.dynamic);
+        } catch (e) {
+          key = null;
         }
-      } catch (e) {
-        key = null;
       }
       recoverySwappingGoal = false;
       escapeInProgress = false;
     };
 
-    try {
-      recoverySwappingGoal = true;
-      bot.pathfinder.setGoal(null);
-      bot.clearControlStates();
-      if (!escapeTile) {
-        // No adjacent safe floor is known (for example, a ledge or unloaded
-        // chunk). Do not blindly walk into unknown space; just replan once.
-        setTimeout(restoreGoal, 350);
+    const tryNextCandidate = () => {
+      if (attemptTimer) clearTimeout(attemptTimer);
+      if (listeners) {
+        bot.removeListener("goal_reached", listeners.onReached);
+        bot.removeListener("path_update", listeners.onPathUpdate);
+      }
+      listeners = null;
+      if (!bot.entity || activeGoal !== goalSnapshot || candidateIndex >= candidates.length) {
+        finishRecovery(true);
         return;
       }
-      const dx = escapeTile.x + 0.5 - bot.entity.position.x;
-      const dz = escapeTile.z + 0.5 - bot.entity.position.z;
-      const escapeYaw = Math.atan2(-dx, -dz);
-      Promise.resolve(bot.look(escapeYaw, 0, true))
-        .catch(() => {})
-        .finally(() => {
-          if (!bot.entity) return restoreGoal();
-          bot.setControlState("forward", true);
-          bot.setControlState("sprint", false);
-          setTimeout(() => {
-            try { bot.setControlState("forward", false); } catch (e) {}
-            restoreGoal();
-          }, 300);
-        });
-    } catch (e) {
-      restoreGoal();
-      key = null;
-    }
+
+      const candidate = candidates[candidateIndex++];
+      const tile = candidate.pos;
+      activeEscapeGoal = new goals.GoalBlock(tile.x, tile.y, tile.z);
+      console.warn(`[Pathfinder] Trying 3D escape waypoint ${tile.x},${tile.y},${tile.z} (${candidate.supported ? "supported" : "tower candidate"}).`);
+      listeners = {
+        onReached: (reachedGoal) => {
+          if (reachedGoal === activeEscapeGoal) finishRecovery(true);
+        },
+        onPathUpdate: (result) => {
+          if (result && (result.status === "noPath" || result.status === "timeout")) {
+            tryNextCandidate();
+          }
+        },
+      };
+      bot.on("goal_reached", listeners.onReached);
+      bot.on("path_update", listeners.onPathUpdate);
+      try {
+        bot.pathfinder.setGoal(activeEscapeGoal, false);
+      } catch (e) {
+        tryNextCandidate();
+        return;
+      }
+      // Don't let one impossible waypoint hold the bot forever.
+      attemptTimer = setTimeout(tryNextCandidate, 6500);
+    };
+
+    tryNextCandidate();
   }
 
   const onPathReset = (reason) => {

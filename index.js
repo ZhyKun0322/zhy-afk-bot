@@ -21,8 +21,8 @@ function installGoalLookAtBlockReachFix() {
   if (!proto || proto.__overheadReachFix) return;
 
   proto.isEnd = function (node) {
-    if (node.distanceTo(this.pos) > this.reach) return false;
-
+    // Measure reach from the bot's eye to a visible block face below; a feet-to-block
+    // center pre-check incorrectly rejects logs directly overhead.
     const dx = node.x - (this.pos.x + 0.5);
     const dy = node.y + this.entityHeight - (this.pos.y + 0.5);
     const dz = node.z - (this.pos.z + 0.5);
@@ -57,56 +57,11 @@ function installGoalLookAtBlockReachFix() {
   proto.__overheadReachFix = true;
 }
 
-// The 2.4.5 executor tries to pillar-place as soon as the feet leave the
-// ground and waits for a slow head turn. On vanilla-like servers that often
-// means the block intersects the player's hitbox and is refused. Delay only
-// upward jump-pillar placements until the feet clear the proposed block, then
-// use Mineflayer's immediate-look placement helper when available.
-function installPillarPlacementFix(bot) {
-  if (!bot || bot.__pillarPlacementFix || typeof bot.placeBlock !== "function") return;
-  const originalPlaceBlock = bot.placeBlock.bind(bot);
-
-  function waitForFeetAbove(y, timeoutMs) {
-    return new Promise((resolve, reject) => {
-      let settled = false;
-      const finish = (error) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        bot.removeListener("physicsTick", check);
-        if (error) reject(error);
-        else resolve();
-      };
-      const check = () => {
-        if (!bot.entity) return finish(new Error("Bot entity disappeared during pillar jump"));
-        if (bot.entity.position.y > y + 2.1) return finish();
-      };
-      const timer = setTimeout(() => finish(new Error("Pillar jump did not clear the placement hitbox")), timeoutMs);
-      bot.on("physicsTick", check);
-      check();
-    });
-  }
-
-  bot.placeBlock = async function (referenceBlock, faceVector) {
-    const isVerticalPillar = Boolean(
-      this.pathfinder && typeof this.pathfinder.isBuilding === "function" &&
-      this.pathfinder.isBuilding() && this.controlState && this.controlState.jump &&
-      faceVector && faceVector.x === 0 && faceVector.y === 1 && faceVector.z === 0 &&
-      referenceBlock && referenceBlock.position,
-    );
-    if (!isVerticalPillar) return originalPlaceBlock(referenceBlock, faceVector);
-
-    await waitForFeetAbove(referenceBlock.position.y, 2400);
-    if (typeof this._placeBlockWithOptions === "function") {
-      return this._placeBlockWithOptions(referenceBlock, faceVector, {
-        swingArm: "right",
-        forceLook: true,
-      });
-    }
-    return originalPlaceBlock(referenceBlock, faceVector);
-  };
-  bot.__pillarPlacementFix = true;
-}
+// Do not wrap bot.placeBlock for pillar movement. The previous custom wrapper
+// waited for the bot to rise more than two blocks above the reference block;
+// depending on the pathfinder's reference face this can never happen during a
+// normal jump and causes every scaffold placement to time out. Use Mineflayer's
+// native placement implementation and let pathfinder handle the jump timing.
 
 installGoalLookAtBlockReachFix();
 
@@ -1702,8 +1657,7 @@ function createBot() {
       addLog(`[Pathfinder] ${bot.version}: canDig=${defaultMove.canDig}, towers=${defaultMove.allow1by1towers}, scaffold=${(defaultMove.scafoldingBlocks || []).length}, sprint=${defaultMove.allowSprinting}`);
       configureDoorAwareMovements(bot, defaultMove);
       installPathfinderCollisionFixes(bot, defaultMove);
-      installPillarPlacementFix(bot);
-      addLog("[Pathfinder] Applied overhead block-reach and pillar-placement compatibility fixes");
+      addLog("[Pathfinder] Applied overhead block-reach fix; native scaffold placement timing enabled");
       let lastPathDiagnosticAt = 0;
       bot.on("path_reset", (reason) => {
         if (!["stuck", "no_scaffolding_blocks", "place_error", "dig_error"].includes(reason)) return;
