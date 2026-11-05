@@ -1035,6 +1035,9 @@ app.post("/start", (req, res) => {
   if (botRunning) return res.json({ success: false, msg: "Already running" });
 
   botRunning = true;
+  clearBotTimeouts();
+  isReconnecting = false;
+  botState.reconnectAttempts = 0;
   createBot();
   addLog("[Control] Bot started");
 
@@ -1045,12 +1048,20 @@ app.post("/stop", (req, res) => {
   if (!botRunning) return res.json({ success: false, msg: "Already stopped" });
 
   botRunning = false;
+  clearBotTimeouts();
+  if (stableConnectionTimerId) {
+    clearTimeout(stableConnectionTimerId);
+    stableConnectionTimerId = null;
+  }
+  isReconnecting = false;
 
   if (bot) {
-    bot.end();
+    const currentBot = bot;
     bot = null;
+    try { currentBot.end(); } catch (e) {}
   }
 
+  botState.connected = false;
   clearAllIntervals();
   addLog("[Control] Bot stopped");
 
@@ -1190,6 +1201,8 @@ let bot = null;
 let activeIntervals = [];
 let reconnectTimeoutId = null;
 let connectionTimeoutId = null;
+let stableConnectionTimerId = null;
+let lastKickReason = null;
 let isReconnecting = false;
 
 function clearBotTimeouts() {
@@ -1222,21 +1235,18 @@ function addInterval(callback, delay) {
 function getReconnectDelay() {
   if (botState.wasThrottled) {
     botState.wasThrottled = false;
-    const throttleDelay = 60000 + Math.floor(Math.random() * 60000);
-    addLog(
-      `[Bot] Throttle detected - using extended delay: ${throttleDelay / 1000}s`,
-    );
+    const throttleDelay = 90000 + Math.floor(Math.random() * 90000);
+    addLog(`[Bot] Server throttle detected; backing off for ${Math.round(throttleDelay / 1000)}s.`);
     return throttleDelay;
   }
 
-  // FIX: read auto-reconnect-delay from settings as base delay
-  const baseDelay = config.utils["auto-reconnect-delay"] || 3000;
-  const maxDelay = config.utils["max-reconnect-delay"] || 30000;
-  const delay = Math.min(
-    baseDelay * Math.pow(2, botState.reconnectAttempts),
-    maxDelay,
-  );
-  const jitter = Math.floor(Math.random() * 2000);
+  // Do not hammer Aternos after a fast post-spawn kick. Attempts are reset
+  // only after a five-minute stable session, not immediately on every spawn.
+  const baseDelay = Math.max(5000, Number(config.utils["auto-reconnect-delay"]) || 10000);
+  const maxDelay = Math.max(baseDelay, Number(config.utils["max-reconnect-delay"]) || 180000);
+  const exponent = Math.min(8, Math.max(0, botState.reconnectAttempts - 1));
+  const delay = Math.min(baseDelay * (2 ** exponent), maxDelay);
+  const jitter = Math.floor(Math.random() * Math.min(5000, Math.max(500, delay * 0.15)));
   return delay + jitter;
 }
 
@@ -1247,18 +1257,19 @@ function getReconnectDelay() {
 // lower half / closed trapdoor / closed fence gate.
 function configureDoorAwareMovements(bot, movements) {
   if (!bot || !movements || typeof movements.getBlock !== "function") return;
-  movements.canOpenDoors = true;
-  if (!movements.openable) movements.openable = new Set();
+  if (!movements.__doorAwareBlockPatch) {
+    movements.canOpenDoors = true;
+    if (!movements.openable) movements.openable = new Set();
 
-  for (const blockInfo of bot.registry.blocksArray || []) {
-    const name = String(blockInfo.name || "");
-    const woodenDoor = name.endsWith("_door") && !name.startsWith("iron_");
-    const woodenTrapdoor = name.endsWith("_trapdoor") && !name.startsWith("iron_");
-    const fenceGate = name.endsWith("_fence_gate");
-    if ((woodenDoor || woodenTrapdoor || fenceGate) && Number.isInteger(blockInfo.id)) {
-      movements.openable.add(blockInfo.id);
+    for (const blockInfo of bot.registry.blocksArray || []) {
+      const name = String(blockInfo.name || "");
+      const woodenDoor = name.endsWith("_door") && !name.startsWith("iron_");
+      const woodenTrapdoor = name.endsWith("_trapdoor") && !name.startsWith("iron_");
+      const fenceGate = name.endsWith("_fence_gate");
+      if ((woodenDoor || woodenTrapdoor || fenceGate) && Number.isInteger(blockInfo.id)) {
+        movements.openable.add(blockInfo.id);
+      }
     }
-  }
 
   const getBlockOriginal = movements.getBlock.bind(movements);
   movements.getBlock = function (pos, dx, dy, dz) {
@@ -1295,6 +1306,11 @@ function configureDoorAwareMovements(bot, movements) {
     }
     return block;
   };
+    movements.__doorAwareBlockPatch = true;
+  }
+
+  if (bot.__doorAwarePassagePatch) return;
+  bot.__doorAwarePassagePatch = true;
 
   // Remember passages opened by the pathfinder and close them again after the
   // bot has crossed. This prevents doors/gates being left open while avoiding
@@ -1505,6 +1521,10 @@ function installPathfinderCollisionFixes(bot, movements) {
 }
 
 function createBot() {
+  if (!botRunning) {
+    addLog("[Bot] Start skipped: bot is stopped.");
+    return;
+  }
   if (isReconnecting) {
     addLog("[Bot] Already reconnecting, skipping...");
     return;
@@ -1571,8 +1591,17 @@ function createBot() {
       clearBotTimeouts();
       botState.connected = true;
       botState.lastActivity = Date.now();
-      botState.reconnectAttempts = 0;
       isReconnecting = false;
+      lastKickReason = null;
+      if (stableConnectionTimerId) clearTimeout(stableConnectionTimerId);
+      stableConnectionTimerId = setTimeout(() => {
+        if (botState.connected) {
+          botState.reconnectAttempts = 0;
+          botState.wasThrottled = false;
+          addLog("[Bot] Connection stable for 5 minutes; reconnect backoff reset.");
+        }
+        stableConnectionTimerId = null;
+      }, 5 * 60 * 1000);
 
       addLog(
         `[Bot] [+] Successfully spawned on server! (Version: ${bot.version})`,
@@ -1592,20 +1621,29 @@ function createBot() {
       const mcData = require("minecraft-data")(bot.version);
       const defaultMove = new Movements(bot, mcData);
       defaultMove.allowFreeMotion = false;
-      // Navigation must be able to clear ordinary terrain instead of pushing
-      // the bot against solid blocks. Protect valuable / dangerous blocks.
-      defaultMove.canDig = true;
-      // Prefer breaking cheap foliage/soft obstructions over repeatedly
-      // steering into them or making huge detours around dense tree canopies.
-      defaultMove.digCost = 0.75;
+      // Safe profile for following, combat, guarding and ordinary movement:
+      // never try to mine through houses, protected plots or solid walls.
+      // Route around them instead of repeatedly issuing a server-rejected dig.
+      defaultMove.canDig = false;
       defaultMove.liquidCost = 1000;
       defaultMove.fallDamageCost = 1000;
-      defaultMove.allow1by1towers = true;
-      // Avoid parkour shortcuts in combat/tree canopies; they are a frequent
-      // source of corner collisions. Normal step-ups and scaffold towers remain.
+      defaultMove.allow1by1towers = false;
       defaultMove.allowParkour = false;
       defaultMove.allowSprinting = false;
-      bot.pathfinder.thinkTimeout = 10000;
+
+      // Dedicated wood profile: clear foliage and tower only while harvesting.
+      // Structural blocks are protected below so the bot will not cut through
+      // village houses, fences, paths or player builds to reach a tree.
+      const woodMove = new Movements(bot, mcData);
+      woodMove.allowFreeMotion = false;
+      woodMove.canDig = true;
+      woodMove.digCost = 1.25;
+      woodMove.liquidCost = 1000;
+      woodMove.fallDamageCost = 1000;
+      woodMove.allow1by1towers = true;
+      woodMove.allowParkour = false;
+      woodMove.allowSprinting = false;
+      bot.pathfinder.thinkTimeout = 15000;
       if (defaultMove.blocksCantBreak && mcData.blocksByName) {
         const protectedNames = [
           'bedrock','barrier','end_portal_frame','end_portal','nether_portal',
@@ -1641,21 +1679,44 @@ function createBot() {
           if (item && !defaultMove.scafoldingBlocks.includes(item.id)) defaultMove.scafoldingBlocks.push(item.id);
         }
       }
-      // Leaf blocks are safe to clear even next to water: they do not retain a
-      // fluid source. Some registry revisions misclassify them as unbreakable,
-      // and the generic anti-fluid-flow guard can otherwise block forest routes.
-      if (mcData.blocksArray && defaultMove.blocksCantBreak && defaultMove.blocksToAvoid) {
+      // Woodcutting must not dig through constructed blocks. Protect common
+      // house/building materials while leaving leaves and soft foliage breakable.
+      const structuralPatterns = [
+        /_planks$/, /_log$/, /_wood$/, /_stem$/, /_hyphae$/, /_stairs$/,
+        /_slab$/, /_fence$/, /_fence_gate$/, /_wall$/, /_door$/, /_trapdoor$/,
+        /_glass$/, /_glass_pane$/, /_wool$/, /_terracotta$/, /_concrete$/,
+        /_bricks$/, /_brick$/, /_carpet$/, /_bed$/, /_sign$/, /_hanging_sign$/,
+      ];
+      const structuralNames = new Set([
+        "stone", "cobblestone", "mossy_cobblestone", "stone_bricks",
+        "mossy_stone_bricks", "cracked_stone_bricks", "chiseled_stone_bricks",
+        "andesite", "polished_andesite", "diorite", "polished_diorite",
+        "granite", "polished_granite", "deepslate", "cobbled_deepslate",
+        "polished_deepslate", "deepslate_bricks", "deepslate_tiles",
+        "bricks", "mud_bricks", "packed_mud", "sandstone", "red_sandstone",
+        "smooth_sandstone", "smooth_red_sandstone", "prismarine",
+        "dark_prismarine", "prismarine_bricks", "quartz_block", "quartz_bricks",
+        "glass", "glass_pane", "iron_bars", "chain", "lantern", "soul_lantern",
+        "torch", "wall_torch", "crafting_table", "furnace", "blast_furnace",
+        "smoker", "barrel", "chest", "trapped_chest", "ender_chest",
+      ]);
+      if (woodMove.blocksCantBreak && mcData.blocksArray) {
         const leafIds = new Set();
         for (const block of mcData.blocksArray) {
-          if (block.name && block.name.endsWith("_leaves")) {
-            leafIds.add(block.id);
-            defaultMove.blocksCantBreak.delete(block.id);
-            defaultMove.blocksToAvoid.delete(block.id);
+          const name = String(block.name || "");
+          if (name.endsWith("_leaves")) leafIds.add(block.id);
+          if (structuralNames.has(name) || structuralPatterns.some((pattern) => pattern.test(name))) {
+            woodMove.blocksCantBreak.add(block.id);
           }
         }
-        if (leafIds.size && typeof defaultMove.safeToBreak === "function") {
-          const originalSafeToBreak = defaultMove.safeToBreak.bind(defaultMove);
-          defaultMove.safeToBreak = function (block) {
+        // Leaves are specifically allowed to be cleared by the wood profile.
+        for (const id of leafIds) {
+          woodMove.blocksCantBreak.delete(id);
+          if (woodMove.blocksToAvoid) woodMove.blocksToAvoid.delete(id);
+        }
+        if (leafIds.size && typeof woodMove.safeToBreak === "function") {
+          const originalSafeToBreak = woodMove.safeToBreak.bind(woodMove);
+          woodMove.safeToBreak = function (block) {
             if (block && leafIds.has(block.type)) {
               const oldDontCreateFlow = this.dontCreateFlow;
               this.dontCreateFlow = false;
@@ -1665,15 +1726,27 @@ function createBot() {
             return originalSafeToBreak(block);
           };
         }
-        addLog(`[Pathfinder] Leaf clearing enabled for ${leafIds.size} leaf block types`);
+        addLog(`[Pathfinder] Wood profile: foliage clearing enabled for ${leafIds.size} leaf block types; structural blocks protected.`);
       }
-      // Avoid sprinting through tight corners: laggy servers can make the
-      // executor overshoot a one-block waypoint. Combat still sprints manually.
-      defaultMove.allowSprinting = false;
-      addLog(`[Pathfinder] ${bot.version}: canDig=${defaultMove.canDig}, towers=${defaultMove.allow1by1towers}, scaffold=${(defaultMove.scafoldingBlocks || []).length}, sprint=${defaultMove.allowSprinting}`);
+      if (Array.isArray(woodMove.scafoldingBlocks)) {
+        for (const name of [
+          'dirt','coarse_dirt','rooted_dirt','cobblestone','cobbled_deepslate',
+          'deepslate','polished_deepslate','netherrack','stone','andesite',
+          'stone_bricks','mossy_cobblestone','bricks',
+          'oak_planks','spruce_planks','birch_planks','jungle_planks',
+          'acacia_planks','dark_oak_planks','mangrove_planks','cherry_planks',
+          'crimson_planks','warped_planks'
+        ]) {
+          const item = mcData.itemsByName && mcData.itemsByName[name];
+          if (item && !woodMove.scafoldingBlocks.includes(item.id)) woodMove.scafoldingBlocks.push(item.id);
+        }
+      }
+      addLog(`[Pathfinder] ${bot.version}: normal canDig=${defaultMove.canDig}, wood canDig=${woodMove.canDig}, wood towers=${woodMove.allow1by1towers}, scaffold=${(woodMove.scafoldingBlocks || []).length}`);
       configureDoorAwareMovements(bot, defaultMove);
+      configureDoorAwareMovements(bot, woodMove);
       installPathfinderCollisionFixes(bot, defaultMove);
-      addLog("[Pathfinder] Applied overhead block-reach fix; native scaffold placement timing enabled");
+      installPathfinderCollisionFixes(bot, woodMove);
+      addLog("[Pathfinder] Safe navigation profile and protected woodcutting profile enabled.");
       let lastPathDiagnosticAt = 0;
       bot.on("path_reset", (reason) => {
         if (!["stuck", "no_scaffolding_blocks", "place_error", "dig_error"].includes(reason)) return;
@@ -1695,7 +1768,7 @@ function createBot() {
 
       // chat commands: !wood !follow !kill !guard !pvp ...
       if (!config.commands || config.commands.enabled !== false) {
-        cmd.initCommands(bot, mcData, defaultMove, { addInterval, addLog, config });
+        cmd.initCommands(bot, mcData, defaultMove, { addInterval, addLog, config, woodMove });
       }
 
       // Attempt creative mode (only works if bot has OP and enabled in settings)
@@ -1722,7 +1795,8 @@ function createBot() {
       // FIX: stringify reason if it's an object to make it readable in logs
       const kickReason =
         typeof reason === "object" ? JSON.stringify(reason) : reason;
-      addLog(`[Bot] Kicked: ${kickReason}`);
+      lastKickReason = String(kickReason || "Unknown kick reason");
+      addLog(`[Bot] Kicked: ${lastKickReason}`);
       botState.connected = false;
       botState.errors.push({
         type: "kicked",
@@ -1735,7 +1809,9 @@ function createBot() {
       if (
         reasonStr.includes("throttl") ||
         reasonStr.includes("wait before reconnect") ||
-        reasonStr.includes("too fast")
+        reasonStr.includes("too fast") ||
+        reasonStr.includes("too many login") ||
+        reasonStr.includes("rate limit")
       ) {
         addLog(
           "[Bot] Throttle kick detected - will use extended reconnect delay",
@@ -1755,7 +1831,12 @@ function createBot() {
 
     // FIX: 'end' is the single reconnect trigger
     bot.on("end", (reason) => {
-      addLog(`[Bot] Disconnected: ${reason || "Unknown reason"}`);
+      const disconnectReason = String(reason || lastKickReason || "Socket closed without a reason");
+      addLog(`[Bot] Disconnected: ${disconnectReason}`);
+      if (stableConnectionTimerId) {
+        clearTimeout(stableConnectionTimerId);
+        stableConnectionTimerId = null;
+      }
       botState.connected = false;
       clearAllIntervals();
       spawnHandled = false; // reset for next connection
@@ -1766,13 +1847,12 @@ function createBot() {
         config.discord.events.disconnect
       ) {
         sendDiscordWebhook(
-          `[-] **Disconnected**: ${reason || "Unknown"}`,
+          `[-] **Disconnected**: ${disconnectReason}`,
           0xf87171,
         );
       }
 
-      // ALWAYS reconnect — bot must never leave the server
-      scheduleReconnect();
+      scheduleReconnect(disconnectReason);
     });
 
     bot.on("error", (err) => {
@@ -1787,27 +1867,28 @@ function createBot() {
   }
 }
 
-function scheduleReconnect() {
+function scheduleReconnect(reason = "connection ended") {
   clearBotTimeouts();
 
-  // FIX: don't stack reconnect if already waiting
+  if (!botRunning || config.utils["auto-reconnect"] === false) {
+    addLog("[Bot] Reconnect skipped: bot was stopped or auto-reconnect is disabled.");
+    isReconnecting = false;
+    return;
+  }
   if (isReconnecting) {
-    addLog("[Bot] Reconnect already scheduled, skipping duplicate.");
+    addLog("[Bot] Reconnect already scheduled; duplicate request ignored.");
     return;
   }
 
   isReconnecting = true;
   botState.reconnectAttempts++;
-
   const delay = getReconnectDelay();
-  addLog(
-    `[Bot] Reconnecting in ${delay / 1000}s (attempt #${botState.reconnectAttempts})`,
-  );
+  addLog(`[Bot] Reconnecting in ${Math.round(delay / 1000)}s (attempt #${botState.reconnectAttempts}; reason: ${reason}).`);
 
   reconnectTimeoutId = setTimeout(() => {
     reconnectTimeoutId = null;
     isReconnecting = false;
-    createBot();
+    if (botRunning && config.utils["auto-reconnect"] !== false) createBot();
   }, delay);
 }
 

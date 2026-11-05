@@ -279,9 +279,45 @@ function createNav(bot) {
   let lastProgressPosition = null;
   let lastProgressAt = Date.now();
   let missingGoalSince = 0;
+  let busyActionSince = 0;
 
   function followGoal(entity, range) {
-    return new goals.GoalFollow(entity, range);
+    const goal = new goals.GoalFollow(entity, range);
+    const originalIsEnd = goal.isEnd.bind(goal);
+    // GoalFollow normally uses only Euclidean distance. That lets it report
+    // "arrived" when the player is close on the other side of a house wall.
+    // Require both a body-height corridor and eye line-of-sight from the
+    // candidate node before accepting the node as the follow destination.
+    goal.isEnd = (node) => {
+      if (!originalIsEnd(node) || !entity.position || !bot.world) return false;
+      try {
+        const candidateFeet = new Vec3(node.x + 0.5, node.y, node.z + 0.5);
+        const targetFeet = entity.position;
+        const fromBody = candidateFeet.offset(0, 0.35, 0);
+        const toBody = targetFeet.offset(0, 0.35, 0);
+        const bodyDelta = toBody.minus(fromBody);
+        const bodyDistance = bodyDelta.norm();
+        if (bodyDistance > 0.6) {
+          const bodyHit = bot.world.raycast(fromBody, bodyDelta.normalize(), bodyDistance);
+          if (bodyHit) return false;
+        }
+
+        const fromEyes = candidateFeet.offset(0, bot.entity.height || 1.62, 0);
+        const toEyes = targetFeet.offset(0, (entity.height || 1.8) * 0.6, 0);
+        const eyeDelta = toEyes.minus(fromEyes);
+        const eyeDistance = eyeDelta.norm();
+        if (eyeDistance > 0.6) {
+          const eyeHit = bot.world.raycast(fromEyes, eyeDelta.normalize(), eyeDistance);
+          if (eyeHit) return false;
+        }
+        return true;
+      } catch (e) {
+        // If the world raycast cannot be evaluated (e.g. an unloaded edge),
+        // stay conservative and keep navigating rather than stopping early.
+        return false;
+      }
+    };
+    return goal;
   }
 
   function setActiveGoal(goal, dynamic = false) {
@@ -484,9 +520,36 @@ function createNav(bot) {
   };
   const onPhysicsTick = () => {
     if (!bot.entity || !activeGoal || escapeInProgress) return;
-    if (bot.pathfinder.isMining() || bot.pathfinder.isBuilding()) return;
-
     const now = Date.now();
+    const mining = !!(bot.pathfinder.isMining && bot.pathfinder.isMining());
+    const building = !!(bot.pathfinder.isBuilding && bot.pathfinder.isBuilding());
+    if (mining || building) {
+      if (!busyActionSince) busyActionSince = now;
+      // A permission-rejected dig or scaffold placement can leave the path
+      // executor busy without moving. Never let that state disable recovery
+      // forever; cancel only after a generous grace period.
+      if (now - busyActionSince > 12000) {
+        const snapshot = activeGoal;
+        console.warn(`[Pathfinder] ${mining ? "dig" : "scaffold placement"} made no progress for 12s; cancelling the stalled action and retrying the same goal.`);
+        recoverySwappingGoal = true;
+        try {
+          if (mining && typeof bot.stopDigging === "function") bot.stopDigging();
+          bot.pathfinder.setGoal(null);
+        } catch (e) {}
+        setTimeout(() => {
+          if (activeGoal === snapshot && bot.entity) {
+            try { bot.pathfinder.setGoal(snapshot.goal, snapshot.dynamic); } catch (e) {}
+          }
+          recoverySwappingGoal = false;
+          busyActionSince = 0;
+          lastProgressPosition = bot.entity ? bot.entity.position.clone() : null;
+          lastProgressAt = Date.now();
+        }, 250);
+        busyActionSince = now;
+      }
+      return;
+    }
+    busyActionSince = 0;
     // A dynamic GoalFollow remains active when its target is in range. Static
     // goals can also complete on this tick, so don't mistake arrival for a jam.
     let reached = false;
@@ -604,7 +667,10 @@ function createNav(bot) {
           if (recoverySwappingGoal) return;
           if (nextGoal !== goal) finish(new Error("Navigation goal was replaced"));
         };
-        const onPathStop = () => finish(new Error("Navigation stopped"));
+        const onPathStop = () => {
+          if (recoverySwappingGoal) return;
+          finish(new Error("Navigation stopped"));
+        };
         const cancel = (error) => finish(error || new Error("Navigation cancelled"));
 
         cancelGoalPromise = cancel;
@@ -649,10 +715,6 @@ function createNav(bot) {
 // ============================================================
 function createMelee(bot, nav) {
   let lastAttack = 0;
-  let lastJump = 0;
-  let manual = false;
-  let strafeDir = 0;
-  let strafeUntil = 0;
   let switching = false;
 
   async function ensureWeapon(prefer) {
@@ -671,96 +733,48 @@ function createMelee(bot, nav) {
   }
 
   function release() {
-    manual = false;
-    for (const c of ["forward", "back", "left", "right", "sprint"]) {
-      if (bot.controlState[c]) bot.setControlState(c, false);
+    // Combat no longer drives forward/strafe controls manually. Those controls
+    // can fight the pathfinder at corners and against house foundations.
+    for (const c of ["forward", "back", "left", "right", "sprint", "jump"]) {
+      try {
+        if (bot.controlState && bot.controlState[c]) bot.setControlState(c, false);
+      } catch (e) {}
     }
   }
 
-  function jump() {
-    lastJump = Date.now();
-    bot.setControlState("jump", true);
-    setTimeout(() => {
-      try {
-        bot.setControlState("jump", false);
-      } catch (e) {}
-    }, 120);
-  }
-
   function hit(target) {
-    bot.attack(target);
-    lastAttack = Date.now();
+    try {
+      bot.attack(target);
+      lastAttack = Date.now();
+    } catch (e) {}
   }
 
   function step(target, opts = {}) {
     if (!target || !target.position || !bot.entity) return;
     const now = Date.now();
-    const reach = opts.reach || 3.0;
+    const reach = Number.isFinite(opts.reach) ? opts.reach : 3.0;
 
     ensureWeapon(opts.prefer || "sword");
 
-    const d = reachDistance(bot, target);
-    const dy = target.position.y - bot.entity.position.y;
+    const distance = reachDistance(bot, target);
     lookAtPoint(bot, target.position.offset(0, (target.height || 1.8) * 0.6, 0));
 
+    // Always keep a live pathfinder goal while approaching. The older close-
+    // range controller called nav.stop() and pushed forward/strafe directly;
+    // near a wall, fence, tree or house corner that left no recovery goal at
+    // all. A smaller follow radius also prevents stopping on the wrong side
+    // of a wall merely because the target is within two Euclidean blocks.
+    nav.follow(target, 1.1);
+
     const visible = hasLineOfSight(bot, target);
-    const laneClear = hasClearMeleeLane(bot, target);
-    const useManual = visible && laneClear &&
-      (manual ? d < 5.0 && Math.abs(dy) < 2 : d < 3.8 && Math.abs(dy) < 1.5);
-    const cd = cooldownMs(bot.heldItem);
-    const chargedIn = Math.max(0, lastAttack + cd + 30 - now);
-    const inReach = d <= reach - 0.05;
+    const laneClear = hasClearMeleeLane(bot, target, 2.2);
+    const cooldown = cooldownMs(bot.heldItem);
+    const charged = now - lastAttack >= cooldown + 30;
 
-    if (!useManual) {
-      if (manual) release();
-      nav.follow(target, 2);
-      // Do not swing through a wall/leaf/fence merely because Euclidean
-      // reach is short. Wait until the walking lane and sightline are clear.
-      if (visible && laneClear && inReach && chargedIn === 0) hit(target);
-      return;
-    }
-
-    // ---- close range: we drive the controls ourselves ----
-    nav.stop();
-    manual = true;
-    const crit = !!opts.crit;
-
-    // crits can't happen while sprinting; plain hits want the sprint knockback
-    setCtl(bot, "sprint", !crit);
-    setCtl(bot, "forward", d > (crit ? 2.3 : 1.6));
-    setCtl(bot, "back", crit && d < 1.1);
-
-    if (opts.strafe && d < 3.5) {
-      if (now > strafeUntil) {
-        strafeDir = [-1, 0, 1][Math.floor(Math.random() * 3)];
-        strafeUntil = now + 500 + Math.random() * 700;
-      }
-      setCtl(bot, "left", strafeDir < 0);
-      setCtl(bot, "right", strafeDir > 0);
-    } else {
-      setCtl(bot, "left", false);
-      setCtl(bot, "right", false);
-    }
-
-    if (!crit) {
-      if (inReach && chargedIn === 0) hit(target);
-      return;
-    }
-
-    // ---- crit logic ----
-    const e = bot.entity;
-    const inAir = !e.onGround && !e.isInWater && !e.isInLava;
-    const falling = inAir && e.velocity.y < -0.03;
-
-    if (falling) {
-      if (inReach && chargedIn === 0) hit(target);
-    } else if (e.onGround) {
-      // A jump needs ~300ms to start falling, so launch when the bar is almost full
-      if (d <= reach + 1.0 && chargedIn <= 330 && now - lastJump > 500) {
-        jump();
-      } else if (inReach && chargedIn === 0 && now - lastAttack > cd + 1200) {
-        hit(target); // jumping isn't working (low ceiling, cobweb...) - don't just stand there
-      }
+    // Attack only when the hitbox is in reach and a block is not between the
+    // bot and target. Movement remains exclusively pathfinder-controlled.
+    if (distance <= reach - 0.05 && visible && laneClear && charged) {
+      hit(target);
     }
   }
 

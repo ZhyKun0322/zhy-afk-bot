@@ -216,8 +216,15 @@ function createPvp(bot, deps) {
 
   function bowStep(target, d, now) {
     releaseShield();
-    nav.stop();
     melee.release();
+
+    // A target behind a wall/house is not a reason to stand still and wait.
+    // Keep a close follow goal so the pathfinder can move around the obstacle.
+    if (!U.hasLineOfSight(bot, target)) {
+      cancelDraw();
+      nav.follow(target, 1.1);
+      return;
+    }
 
     if (!bot.heldItem || bot.heldItem.name !== "bow") {
       cancelDraw();
@@ -240,8 +247,10 @@ function createPvp(bot, deps) {
       return;
     }
 
+    // Stop only after the shot lane is visibly clear; do not combine manual
+    // strafing with pathfinder navigation near buildings and obstacles.
+    nav.stop();
     U.look(bot, aim.yaw, aim.pitch);
-    strafe(now, cfg.strafe && !drawing);
 
     if (!drawing) {
       if (now - lastShot < 350) return;

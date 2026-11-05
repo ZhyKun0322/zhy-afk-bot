@@ -104,7 +104,7 @@ function parseChatLine(line) {
 }
 
 function initCommands(bot, mcData, defaultMove, deps) {
-  const { addInterval, addLog, config } = deps;
+  const { addInterval, addLog, config, woodMove = defaultMove } = deps;
   const cfg = buildConfig(config.commands);
   if (!cfg.enabled) return;
 
@@ -379,6 +379,11 @@ function initCommands(bot, mcData, defaultMove, deps) {
     sleepBedKey = null;
     ctx.mode = mode;
     ctx.owner = owner || null;
+    try {
+      bot.pathfinder.setMovements(mode === "wood" ? woodMove : defaultMove);
+    } catch (e) {
+      log("movement profile switch error: " + e.message);
+    }
     killState.target = null;
     killState.emptyScans = 0;
     killState.kills = 0;
@@ -400,6 +405,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
       melee.release();
       nav.stop();
       bot.pathfinder.setGoal(null);
+      bot.pathfinder.setMovements(defaultMove);
       bot.clearControlStates();
       bot.deactivateItem();
     } catch (e) {}
@@ -414,6 +420,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
   function goHome() {
     if (!ctx.home || !bot.entity) return;
     const h = ctx.home;
+    bot.pathfinder.setMovements(defaultMove);
     nav.forget();
     bot.pathfinder.setGoal(new goals.GoalNear(h.x, h.y, h.z, 1));
   }
@@ -692,7 +699,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
       }
       return;
     }
-    nav.follow(ent, 2);
+    nav.follow(ent, 1.1);
   }
 
   // ============================================================
@@ -722,7 +729,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
       melee.step(threat, { crit: false, prefer: "sword" });
     } else {
       melee.release();
-      nav.follow(player, 3);
+      nav.follow(player, 1.1);
     }
   }
 
@@ -777,7 +784,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
   function run(name, args, username) {
     switch (name) {
       case "help":
-        say("!wood [n] !follow !kill !guard !unguard !pvp [name] !sleep !armor !inventory !radius !unsave !stop");
+        say("!wood [n] !follow !kill !guard !unguard !pvp [name] !sleep !armor !inventory !pathstatus !radius !unsave !stop");
         return;
 
       case "stop":
@@ -843,6 +850,22 @@ function initCommands(bot, mcData, defaultMove, deps) {
         say("Dropping everything from my inventory and equipment...");
         dropAllInventory().catch((e) => log("inventory drop error: " + e.message));
         return;
+
+      case "pathstatus": {
+        const pos = bot.entity && bot.entity.position;
+        const goal = bot.pathfinder && bot.pathfinder.goal;
+        const path = bot.pathfinder && Array.isArray(bot.pathfinder.path) ? bot.pathfinder.path : [];
+        const details = "mode=" + ctx.mode +
+          ", goal=" + (goal ? (goal.constructor && goal.constructor.name || "active") : "none") +
+          ", nodes=" + path.length +
+          ", moving=" + !!(bot.pathfinder && bot.pathfinder.isMoving && bot.pathfinder.isMoving()) +
+          ", mining=" + !!(bot.pathfinder && bot.pathfinder.isMining && bot.pathfinder.isMining()) +
+          ", building=" + !!(bot.pathfinder && bot.pathfinder.isBuilding && bot.pathfinder.isBuilding()) +
+          (pos ? ", pos=" + pos.x.toFixed(1) + "," + pos.y.toFixed(1) + "," + pos.z.toFixed(1) : "");
+        log("pathstatus: " + details);
+        say("Path status: " + details);
+        return;
+      }
 
       case "wood": {
         if (ctx.mode === "wood") {
