@@ -440,6 +440,9 @@ function initCommands(bot, mcData, defaultMove, deps) {
         if (done) return;
         done = true;
         clearTimeout(timer);
+        if (!ok) {
+          try { bot.pathfinder.setGoal(null); } catch (e) {}
+        }
         nav.forget();
         resolve(ok);
       };
@@ -449,8 +452,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
         } catch (e) {}
         finish(false);
       }, ms);
-      bot.pathfinder
-        .goto(goal)
+      nav.gotoGoal(goal)
         .then(() => finish(true))
         .catch(() => finish(false));
     });

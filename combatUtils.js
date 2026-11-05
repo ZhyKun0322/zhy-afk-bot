@@ -238,123 +238,188 @@ function reachDistance(bot, target) {
 function createNav(bot) {
   let key = null;
   let followState = null;
-  let lastFollowPosition = null;
-  let lastFollowProgress = 0;
-  let lastFollowRecovery = 0;
   let gotoState = null;
-  let lastGotoPosition = null;
-  let lastGotoProgress = 0;
-  let lastGotoRecovery = 0;
+  let activeGoal = null;
+  let lastEscapeAt = 0;
+  let escapeCount = 0;
+  let escapeInProgress = false;
+  let recoverySwappingGoal = false;
+  let cancelGoalPromise = null;
 
   function followGoal(entity, range) {
     return new goals.GoalFollow(entity, range);
   }
 
+  function setActiveGoal(goal, dynamic = false) {
+    activeGoal = { goal, dynamic };
+    bot.pathfinder.setGoal(goal, dynamic);
+  }
+
+  // The pathfinder emits path_reset('stuck') after a node cannot be reached.
+  // Reissuing the identical route from the identical position is not enough:
+  // briefly move off-axis, then calculate a fresh path from the new position.
+  function escapeBlockedNode() {
+    const now = Date.now();
+    if (escapeInProgress || !activeGoal || !bot.entity || now - lastEscapeAt < 1800) return;
+    if (bot.pathfinder.isMining() || bot.pathfinder.isBuilding()) return;
+
+    escapeInProgress = true;
+    lastEscapeAt = now;
+    escapeCount++;
+    const direction = escapeCount % 2 === 0 ? 1 : -1;
+    const goalSnapshot = activeGoal;
+    const yaw = Number.isFinite(bot.entity.yaw) ? bot.entity.yaw : 0;
+    const pitch = Number.isFinite(bot.entity.pitch) ? bot.entity.pitch : 0;
+
+    try {
+      recoverySwappingGoal = true;
+      bot.pathfinder.setGoal(null);
+      bot.clearControlStates();
+      // Turn 90 degrees and make a short jump-step away from the collision.
+      // This avoids repeatedly steering into the exact same face/corner.
+      Promise.resolve(bot.look(yaw + direction * Math.PI / 2, pitch, true))
+        .catch(() => {})
+        .finally(() => {
+          if (!bot.entity) {
+            escapeInProgress = false;
+            return;
+          }
+          try {
+            bot.setControlState("forward", true);
+            bot.setControlState("jump", true);
+          } catch (e) {}
+
+          setTimeout(() => {
+            try {
+              bot.setControlState("forward", false);
+              bot.setControlState("jump", false);
+              bot.setControlState("left", false);
+              bot.setControlState("right", false);
+              bot.setControlState("sprint", false);
+            } catch (e) {}
+
+            // If another command replaced navigation while escaping, don't
+            // restore the previous command's goal over the new one.
+            if (activeGoal === goalSnapshot && bot.entity) {
+              try {
+                if (goalSnapshot.goal && goalSnapshot.goal.entity && !goalSnapshot.goal.entity.position) {
+                  activeGoal = null;
+                  key = null;
+                } else {
+                  bot.pathfinder.setGoal(goalSnapshot.goal, goalSnapshot.dynamic);
+                }
+              } catch (e) {
+                key = null;
+              }
+            }
+            recoverySwappingGoal = false;
+            escapeInProgress = false;
+          }, 320);
+        });
+    } catch (e) {
+      recoverySwappingGoal = false;
+      escapeInProgress = false;
+      key = null;
+    }
+  }
+
+  const onPathReset = (reason) => {
+    if (reason === "stuck") escapeBlockedNode();
+  };
+  bot.on("path_reset", onPathReset);
+  bot.once("end", () => bot.removeListener("path_reset", onPathReset));
+
   return {
     follow(entity, range = 2) {
+      if (!entity || !entity.position) return;
       const k = "f:" + entity.id + ":" + range;
-      if (k !== key) {
-        key = k;
-        followState = { entity, range };
-        gotoState = null;
-        lastGotoPosition = null;
-        lastFollowPosition = bot.entity && bot.entity.position.clone();
-        lastFollowProgress = Date.now();
-        lastFollowRecovery = 0;
-        bot.pathfinder.setGoal(followGoal(entity, range), true);
-        return;
-      }
-
-      // GoalFollow is dynamic, but the path executor can remain wedged against
-      // a collision edge or a closed interactable block. Re-issue the goal if
-      // the target is still out of range and the bot has not made progress.
-      if (!followState || !bot.entity || !entity.position) return;
-      const now = Date.now();
-      const position = bot.entity.position;
-      const moved = lastFollowPosition ? position.distanceTo(lastFollowPosition) : 0;
-      if (moved >= 0.12) {
-        lastFollowPosition = position.clone();
-        lastFollowProgress = now;
-      }
-
-      const distance = position.distanceTo(entity.position);
-      if (distance <= range + 0.8) {
-        lastFollowPosition = position.clone();
-        lastFollowProgress = now;
-        return;
-      }
-
-      if (now - lastFollowProgress > 2200 && now - lastFollowRecovery > 2200) {
-        lastFollowRecovery = now;
-        lastFollowProgress = now;
-        lastFollowPosition = position.clone();
-        try {
-          bot.pathfinder.setGoal(null);
-          bot.pathfinder.setGoal(followGoal(entity, range), true);
-        } catch (e) {
-          // A new path will be attempted on the next follow tick.
-          key = null;
-        }
-      }
+      if (k === key) return;
+      key = k;
+      followState = { entity, range };
+      gotoState = null;
+      escapeInProgress = false;
+      setActiveGoal(followGoal(entity, range), true);
     },
     goto(x, y, z, range = 1) {
       const nextKey = "g:" + Math.floor(x) + "," + Math.floor(y) + "," + Math.floor(z) + ":" + range;
-      const now = Date.now();
-      if (nextKey !== key) {
-        key = nextKey;
-        followState = null;
-        lastFollowPosition = null;
-        gotoState = { x, y, z, range };
-        lastGotoPosition = bot.entity && bot.entity.position.clone();
-        lastGotoProgress = now;
-        lastGotoRecovery = 0;
-        bot.pathfinder.setGoal(new goals.GoalNear(x, y, z, range));
-        return;
-      }
+      if (nextKey === key) return;
+      key = nextKey;
+      followState = null;
+      gotoState = { x, y, z, range };
+      escapeInProgress = false;
+      setActiveGoal(new goals.GoalNear(x, y, z, range));
+    },
+    // Used by wood/drop pickup routes that need a completion Promise. This
+    // listens for goal_reached itself so the temporary null-goal used during
+    // stuck recovery does not make pathfinder.goto() reject as GoalChanged.
+    gotoGoal(goal) {
+      key = "promise-goal:" + Date.now();
+      followState = null;
+      gotoState = null;
+      escapeInProgress = false;
+      const goalState = { goal, dynamic: false };
+      activeGoal = goalState;
 
-      // Static destinations (such as a PvP retreat point) need the same
-      // stuck recovery as dynamic follow goals.
-      if (!gotoState || !bot.entity) return;
-      const position = bot.entity.position;
-      const moved = lastGotoPosition ? position.distanceTo(lastGotoPosition) : 0;
-      if (moved >= 0.12) {
-        lastGotoPosition = position.clone();
-        lastGotoProgress = now;
-      }
-      const distance = position.distanceTo({ x: gotoState.x, y: gotoState.y, z: gotoState.z });
-      if (distance <= gotoState.range + 0.8) {
-        lastGotoPosition = position.clone();
-        lastGotoProgress = now;
-        return;
-      }
-      if (now - lastGotoProgress > 2200 && now - lastGotoRecovery > 2200) {
-        lastGotoRecovery = now;
-        lastGotoProgress = now;
-        lastGotoPosition = position.clone();
+      return new Promise((resolve, reject) => {
+        let settled = false;
+        const cleanup = () => {
+          bot.removeListener("goal_reached", onReached);
+          bot.removeListener("path_update", onPathUpdate);
+          bot.removeListener("goal_updated", onGoalUpdated);
+          bot.removeListener("path_stop", onPathStop);
+          if (cancelGoalPromise === cancel) cancelGoalPromise = null;
+        };
+        const finish = (error) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          if (error) reject(error);
+          else resolve();
+        };
+        const onReached = (reachedGoal) => {
+          if (reachedGoal === goal) finish();
+        };
+        const onPathUpdate = (result) => {
+          if (!result) return;
+          if (result.status === "noPath") finish(new Error("No path to the goal"));
+          else if (result.status === "timeout") finish(new Error("Pathfinding timed out"));
+        };
+        const onGoalUpdated = (nextGoal) => {
+          if (recoverySwappingGoal) return;
+          if (nextGoal !== goal) finish(new Error("Navigation goal was replaced"));
+        };
+        const onPathStop = () => finish(new Error("Navigation stopped"));
+        const cancel = (error) => finish(error || new Error("Navigation cancelled"));
+
+        cancelGoalPromise = cancel;
+        bot.on("goal_reached", onReached);
+        bot.on("path_update", onPathUpdate);
+        bot.on("goal_updated", onGoalUpdated);
+        bot.on("path_stop", onPathStop);
         try {
-          bot.pathfinder.setGoal(null);
-          bot.pathfinder.setGoal(new goals.GoalNear(gotoState.x, gotoState.y, gotoState.z, gotoState.range));
+          bot.pathfinder.setGoal(goal, false);
         } catch (e) {
-          key = null;
+          finish(e);
         }
-      }
+      });
     },
     stop() {
-      if (key !== null) {
-        key = null;
-        followState = null;
-        lastFollowPosition = null;
-        gotoState = null;
-        lastGotoPosition = null;
-        bot.pathfinder.setGoal(null);
-      }
+      if (cancelGoalPromise) cancelGoalPromise(new Error("Navigation stopped"));
+      key = null;
+      followState = null;
+      gotoState = null;
+      activeGoal = null;
+      escapeInProgress = false;
+      recoverySwappingGoal = false;
+      bot.pathfinder.setGoal(null);
     },
     forget() {
       key = null;
       followState = null;
-      lastFollowPosition = null;
       gotoState = null;
-      lastGotoPosition = null;
+      activeGoal = null;
+      escapeInProgress = false;
+      recoverySwappingGoal = false;
     },
   };
 }
