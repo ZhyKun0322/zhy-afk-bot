@@ -11,7 +11,7 @@ Date.now = () => fakeNow;
 class Vec3 {
   constructor(x, y, z) { this.x = x; this.y = y; this.z = z; }
   clone() { return new Vec3(this.x, this.y, this.z); }
-  floored() { return { x: Math.floor(this.x), y: Math.floor(this.y), z: Math.floor(this.z) }; }
+  floored() { return new Vec3(Math.floor(this.x), Math.floor(this.y), Math.floor(this.z)); }
   distanceTo(other) { return Math.hypot(this.x - other.x, this.y - other.y, this.z - other.z); }
   offset(x, y, z) { return new Vec3(this.x + x, this.y + y, this.z + z); }
   minus(other) { return new Vec3(this.x - other.x, this.y - other.y, this.z - other.z); }
@@ -105,6 +105,19 @@ try {
   assert.equal(bot.pathfinder.setGoalCalls, 3);
 
   nav.stop();
+
+  // Regression: when there is no immediately safe escape tile, the old code
+  // left routeState="failed" forever. A failed state skipped the watchdog on
+  // every later physics tick. The controller must re-arm and schedule retry.
+  bot.blockAt = () => null;
+  bot.pathfinder.movements = { countScaffoldingItems: () => 0 };
+  const secondTarget = { id: 3, height: 1.8, position: new Vec3(30, 64, 0) };
+  nav.follow(secondTarget, 2.25);
+  for (let i = 0; i < 6; i++) bot.emit('path_update', { status: 'noPath', path: [] });
+  assert.notEqual(nav.status().routeState, 'failed', 'no-safe-tile recovery must not deadlock in failed state');
+  assert.equal(nav.status().lastPathStatus, 'goal_updated');
+  nav.stop(); // also clears the scheduled recovery retry
+
   console.log('Pathfinding navigation regression tests passed.');
 } finally {
   Date.now = realNow;

@@ -2630,13 +2630,51 @@ process.on("unhandledRejection", (reason) => {
   }
 });
 
-process.on("SIGTERM", () => {
-  addLog("[System] SIGTERM received — ignoring, bot will stay alive.");
-});
+let shutdownStarted = false;
+function shutdown(signal) {
+  if (shutdownStarted) return;
+  shutdownStarted = true;
+  addLog(`[System] ${signal} received — shutting down cleanly.`);
 
-process.on("SIGINT", () => {
-  addLog("[System] SIGINT received — ignoring, bot will stay alive.");
-});
+  // Do not allow a disconnect event to schedule another Minecraft connection
+  // while the host is stopping or replacing this process.
+  botRunning = false;
+  isReconnecting = false;
+  clearBotTimeouts();
+  clearAllIntervals();
+  if (stableConnectionTimerId) {
+    clearTimeout(stableConnectionTimerId);
+    stableConnectionTimerId = null;
+  }
+
+  const activeBot = bot;
+  bot = null;
+  botState.connected = false;
+  if (activeBot) {
+    try { activeBot.end(); } catch (error) {
+      addLog(`[System] Error closing Minecraft connection: ${error.message}`);
+    }
+  }
+
+  // Close the dashboard HTTP listener too, then let the container exit.
+  server.close((error) => {
+    if (error) {
+      addLog(`[System] HTTP shutdown error: ${error.message}`);
+      process.exitCode = 1;
+    }
+    process.exit();
+  });
+
+  // Avoid hanging forever if an HTTP request or socket fails to close.
+  const forceExit = setTimeout(() => {
+    addLog("[System] Graceful shutdown timed out; forcing process exit.");
+    process.exit(1);
+  }, 10000);
+  forceExit.unref();
+}
+
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
 
 // =============================
 //===============================

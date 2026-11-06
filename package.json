@@ -1,12 +1,12 @@
 {
   "name": "minecraft-afk-bot",
-  "version": "2.3",
+  "version": "2.4",
   "description": "Robust AFK bot for Minecraft servers with hybrid terrain-aware navigation and pathfinder backports.",
   "main": "index.js",
   "scripts": {
-    "start": "node index.js",
-    "postinstall": "node scripts/patch-pathfinder.js",
-    "test": "node --check index.js && node --check commands.js && node --check pvp.js && node --check combatUtils.js && node --check pathfinder-compat.js && node --check scripts/patch-pathfinder.js && node -e \"JSON.parse(require('fs').readFileSync('settings.json', 'utf8'))\" && node test/pathfinding-nav.test.js && node test/pathfinder-compat.test.js && node test/pathfinder-patch.test.js"
+    "start": "node ./index.js",
+    "postinstall": "node ./scripts/patch-pathfinder.js",
+    "test": "node --check index.js && node --check commands.js && node --check pvp.js && node --check combatUtils.js && node --check pathfinder-compat.js && node --check scripts/patch-pathfinder.js && node -e \"JSON.parse(require('fs').readFileSync('settings.json', 'utf8'))\" && node test/pathfinding-nav.test.js && node test/auto-sleep-contract.test.js && node test/pathfinder-compat.test.js && node test/pathfinder-patch.test.js"
   },
   "author": "Lamgerr",
   "license": "MIT",
@@ -15,5 +15,8 @@
     "minecraft-data": "^3.103.0",
     "mineflayer": "^4.34.0",
     "mineflayer-pathfinder": "^2.4.5"
+  },
+  "engines": {
+    "node": ">=22 <23"
   }
 }

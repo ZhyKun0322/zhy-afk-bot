@@ -434,8 +434,8 @@ function createNav(bot) {
       for (let dz = -3; dz <= 3; dz++) {
         if (dx === 0 && dz === 0) continue;
         const horizontalDistance = Math.hypot(dx, dz);
-        if (horizontalDistance > 3.25) continue;
-        for (let dy = -2; dy <= 2; dy++) {
+        if (horizontalDistance > 5.25) continue;
+        for (let dy = -3; dy <= 3; dy++) {
           const feetPos = p.offset(dx, dy, dz);
           const feet = bot.blockAt(feetPos, false);
           if (!isClearBodyBlock(feet)) continue;
@@ -471,7 +471,9 @@ function createNav(bot) {
       }
     }
     candidates.sort((a, b) => a.score - b.score);
-    return candidates;
+    // Keep the recovery search bounded. The best 20 candidates cover nearby
+    // lateral routes and higher ledges without issuing dozens of expensive A* searches.
+    return candidates.slice(0, 20);
   }
 
   function scheduleEscapeRetry(delay) {
@@ -503,8 +505,18 @@ function createNav(bot) {
     const candidates = findSafeEscapeTiles(goalSnapshot.goal);
     if (!candidates.length) {
       lastEscapeAt = now;
-      console.warn("[Pathfinder] Stuck recovery found no safe 3D escape tile; keeping the original goal and waiting for a new world/path update.");
+      // Critical: do not leave routeState="failed" here. That state suppresses
+      // the physics watchdog permanently. Re-arm the original goal and retry
+      // the escape search after chunks/nearby entities have had time to update.
+      routeState = "pending";
+      routeStateAt = now;
+      lastProgressAt = now;
+      lastProgressPosition = bot.entity.position.clone();
+      lastPathNodeCount = 0;
+      lastPathStatus = "recovery_no_safe_tile_retry";
+      console.warn("[Pathfinder] No safe 3D escape tile is loaded yet; rearming the route and retrying recovery shortly.");
       try { bot.pathfinder.setGoal(goalSnapshot.goal, goalSnapshot.dynamic); } catch (e) {}
+      scheduleEscapeRetry(8000);
       return;
     }
 
@@ -572,8 +584,16 @@ function createNav(bot) {
           if (reachedGoal === activeEscapeGoal) finishRecovery(true);
         },
         onPathUpdate: (result) => {
-          if (result && (result.status === "noPath" || result.status === "timeout")) {
+          if (!result) return;
+          if (result.status === "noPath" || result.status === "timeout") {
             tryNextCandidate();
+            return;
+          }
+          if (result.status === "success") {
+            // Once a route exists, give the executor time to actually walk it.
+            // A* search timeout and physical movement timeout are different.
+            if (attemptTimer) clearTimeout(attemptTimer);
+            attemptTimer = setTimeout(tryNextCandidate, 10000);
           }
         },
       };
@@ -585,8 +605,11 @@ function createNav(bot) {
         tryNextCandidate();
         return;
       }
-      // Don't let one impossible waypoint hold the bot forever.
-      attemptTimer = setTimeout(tryNextCandidate, 6500);
+      // Do not cancel a live A* search before thinkTimeout. The old 6.5s
+      // candidate timer repeatedly replaced routes while the planner was still
+      // computing (configured thinkTimeout is 22s), making escape impossible.
+      const thinkTimeout = Math.max(5000, Number(bot.pathfinder.thinkTimeout) || 5000);
+      attemptTimer = setTimeout(tryNextCandidate, thinkTimeout + 5000);
     };
 
     tryNextCandidate();

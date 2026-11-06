@@ -135,3 +135,22 @@ This version upgrades the navigation behavior rather than only adding more watch
 - `npm test` passes: syntax checks, settings JSON parse, navigation goal regression test, stale-path invalidation regression test, and source-patch fixture tests.
 - The actual installed `node_modules` is not included in this ZIP. The patcher runs during `npm install` and again before the pathfinder module is loaded at startup; it logs whether each upstream backport matched the installed source.
 - Not yet tested on the live Aternos world. Server permissions can still reject digging or placement, and dirt/sand/gravel terrain is intentionally breakable as a last-resort movement option. Check `!pathstatus` and the startup `[Pathfinder patch]` messages if the bot still stalls.
+
+
+# Sleep and path recovery correction v12
+
+## Automatic sleep
+- Auto-sleep no longer refuses to run while the bot is following, hunting, woodcutting, guarding, or fighting. It saves the current task, pauses it, travels to a placed bed within 48 blocks through the shared navigation controller, sleeps, and resumes the task after waking.
+- The bed trip now uses `nav.goto()` instead of calling `bot.pathfinder.setGoal()` directly, so it receives the same no-progress detection and recovery behavior as follow/PvP navigation. If the server refuses sleep (for example, a nearby hostile mob), the task resumes and sleep retries after 30 seconds rather than interrupting the task every five seconds.
+- Search range increased from 16 to 48 blocks. Added `!sleepstatus`, which reports Minecraft world time, day/night phase, current task, nearest loaded bed/distance, and sleep/navigation state.
+- The current sky/time in a screenshot may be daytime even if the computer clock says midnight: Minecraft sleep uses server world time, and a placed bed is required.
+- Home-leash navigation now yields while auto-sleep is navigating, preventing the saved-home controller from replacing the bed goal.
+
+## Stuck recovery
+- Fixed a permanent dead state: when the 3D escape scan found no safe tile, `routeState` stayed `failed`, and the physics watchdog returned forever. It now re-arms the original goal and schedules another scan after nearby chunks/world state can update.
+- Expanded safe escape search from 3.25 to 5.25 blocks horizontally and from ±2 to ±3 vertical blocks, capped at the best 20 candidates.
+- The old 6.5-second candidate timeout could cancel an A* candidate while `thinkTimeout` was 22 seconds. Candidate searches now receive the full think timeout plus a grace period; successful routes get a separate movement window before being abandoned.
+
+## Validation
+- Added regression tests for the no-safe-tile deadlock and automatic sleep preemption/status/navigation contract.
+- Local syntax, configuration, pathfinding mock, package patch fixture, and sleep contract tests must pass before deployment. Live server behavior still requires in-game testing.

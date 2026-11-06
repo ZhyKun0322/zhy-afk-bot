@@ -168,6 +168,11 @@ function initCommands(bot, mcData, defaultMove, deps) {
     onEnd: () => stopMode(false),
   });
 
+  // Auto-sleep may temporarily preempt a long-running command at night. Save
+  // enough information to resume the same task after the bot wakes.
+  let sleepResumeState = null;
+  let currentWoodLimit = 0;
+
   // ---------- armor helpers ----------
   const armorSlots = [
     { destination: "head", slot: 5, test: (name) => /_(helmet|cap)$/.test(name) || name === "turtle_helmet" },
@@ -250,75 +255,174 @@ function initCommands(bot, mcData, defaultMove, deps) {
   let sleepBedKey = null;
   let lastBedSearch = 0;
   let lastNoBedNotice = 0;
+  let lastSleepErrorNotice = 0;
+  let sleepRetryAfter = 0;
+  const BED_SEARCH_RADIUS = 48;
+
+  function worldTimeOfDay() {
+    const raw = bot.time && Number(bot.time.timeOfDay);
+    if (!Number.isFinite(raw)) return null;
+    return ((raw % 24000) + 24000) % 24000;
+  }
 
   function isNight() {
-    const timeOfDay = bot.time && Number(bot.time.timeOfDay);
-    return Number.isFinite(timeOfDay) && timeOfDay >= 12542 && timeOfDay <= 23460;
+    const timeOfDay = worldTimeOfDay();
+    // Vanilla sleep window: dusk through dawn. This is Minecraft world time,
+    // not the host computer's local clock.
+    return timeOfDay !== null && timeOfDay >= 12542 && timeOfDay <= 23460;
+  }
+
+  function findNearbyBed() {
+    return bot.findBlock({
+      matching: (block) => block && typeof bot.isABed === "function" && bot.isABed(block),
+      maxDistance: BED_SEARCH_RADIUS,
+    });
+  }
+
+  function pauseModeForSleep() {
+    if (ctx.mode === "idle" || sleepResumeState) return;
+    const mode = ctx.mode;
+    sleepResumeState = {
+      mode,
+      owner: ctx.owner,
+      pvpTarget: mode === "pvp" ? pvp.currentTarget() : null,
+      woodLimit: currentWoodLimit,
+      kills: killState.kills,
+    };
+    log("Pausing " + mode + " temporarily so I can sleep; the task will resume after waking.");
+    stopMode(true);
+    currentWoodLimit = 0;
+  }
+
+  function resumeModeAfterSleep() {
+    const saved = sleepResumeState;
+    if (!saved || !bot.entity) return;
+    sleepResumeState = null;
+    ctx.sleepNavigating = false;
+    sleepBedKey = null;
+
+    try {
+      if (saved.mode === "wood") {
+        currentWoodLimit = saved.woodLimit || 0;
+        const token = startMode("wood", saved.owner);
+        woodLoop(token, currentWoodLimit).catch((e) => {
+          log("wood resume error: " + e.message);
+          if (token === ctx.token) stopMode(false);
+        });
+      } else if (saved.mode === "pvp") {
+        const targetName = saved.pvpTarget;
+        if (!targetName) return;
+        startMode("pvp", saved.owner);
+        pvp.start(targetName);
+      } else if (["follow", "kill", "guard"].includes(saved.mode)) {
+        startMode(saved.mode, saved.owner);
+        if (saved.mode === "kill") killState.kills = saved.kills || 0;
+      }
+      say("Awake. Resuming " + saved.mode + ".");
+    } catch (e) {
+      log("could not resume " + saved.mode + " after sleeping: " + e.message);
+      say("Awake, but I couldn't resume " + saved.mode + ". Use the command again.");
+    }
+  }
+
+  function sleepStatusText() {
+    const timeOfDay = worldTimeOfDay();
+    const bed = bot.entity ? findNearbyBed() : null;
+    const bedDistance = bed && bot.entity ? bot.entity.position.distanceTo(bed.position) : null;
+    const hasBedItem = !!(bot.inventory && bot.inventory.items().some((item) => /_(bed)$/.test(item.name)));
+    return "enabled=" + ctx.autoSleep +
+      ", worldTime=" + (timeOfDay === null ? "unknown" : Math.floor(timeOfDay)) +
+      ", phase=" + (timeOfDay === null ? "unknown" : (isNight() ? "sleep-window" : "daytime")) +
+      ", mode=" + ctx.mode +
+      ", bed=" + (bed ? (bed.name + " at " + bed.position.x + "," + bed.position.y + "," + bed.position.z + " (" + bedDistance.toFixed(1) + " blocks)") : "none within " + BED_SEARCH_RADIUS) +
+      ", bedItem=" + hasBedItem +
+      ", navigating=" + ctx.sleepNavigating +
+      ", sleeping=" + !!bot.isSleeping;
   }
 
   async function autoSleepTick() {
-    if (!ctx.autoSleep || !bot.entity) {
-      return;
-    }
-    if (bot.isSleeping || sleepAttempt) return;
+    if (!ctx.autoSleep || !bot.entity || bot.isSleeping || sleepAttempt) return;
+
     if (!isNight()) {
       if (ctx.sleepNavigating) {
+        try { nav.stop(); } catch (e) {}
         ctx.sleepNavigating = false;
         sleepBedKey = null;
-        if (ctx.home) goHome();
-        else bot.pathfinder.setGoal(null);
+        resumeModeAfterSleep();
+        if (!sleepResumeState && ctx.mode === "idle" && ctx.home) goHome();
       }
       return;
     }
-    // Do not interrupt active combat, harvesting, or player-follow commands.
-    if (ctx.mode !== "idle" || ctx.eating || ctx.pickup || bot.currentWindow) return;
+
+    // Eating or interacting with a window is a short, non-interruptible action.
+    if (ctx.eating || ctx.pickup || bot.currentWindow) return;
+
     const now = Date.now();
-    if (now - lastBedSearch < 5000) return;
+    if (now < sleepRetryAfter || now - lastBedSearch < 5000) return;
     lastBedSearch = now;
 
-    const bed = bot.findBlock({
-      matching: (block) => block && typeof bot.isABed === "function" && bot.isABed(block),
-      maxDistance: 16,
-    });
+    const bed = findNearbyBed();
     if (!bed) {
       if (ctx.sleepNavigating) {
+        try { nav.stop(); } catch (e) {}
         ctx.sleepNavigating = false;
         sleepBedKey = null;
-        bot.pathfinder.setGoal(null);
+        resumeModeAfterSleep();
       }
       if (now - lastNoBedNotice > 60000) {
         lastNoBedNotice = now;
-        say("Auto-sleep is on, but I can't find a bed within 16 blocks.");
+        const hasBedItem = bot.inventory && bot.inventory.items().some((item) => /_(bed)$/.test(item.name));
+        say(hasBedItem
+          ? "Auto-sleep is on, but I have no placed bed within " + BED_SEARCH_RADIUS + " blocks. Place the bed nearby and I'll use it."
+          : "Auto-sleep is on, but there is no placed bed within " + BED_SEARCH_RADIUS + " blocks. I need a bed nearby; a bed item alone is not enough until it is placed.");
       }
       return;
     }
 
+    // Sleep has priority over follow/kill/wood/guard/PvP. Those tasks are
+    // suspended cleanly and resumed after the wake event.
+    if (ctx.mode !== "idle") pauseModeForSleep();
+
     const distance = bot.entity.position.distanceTo(bed.position);
     const bedKey = `${bed.position.x},${bed.position.y},${bed.position.z}`;
-    if (distance > 3.2) {
+    if (distance > 2.65) {
       ctx.sleepNavigating = true;
-      if (sleepBedKey !== bedKey) {
+      if (sleepBedKey !== bedKey || !bot.pathfinder.goal) {
         sleepBedKey = bedKey;
         try {
-          bot.pathfinder.setGoal(new goals.GoalNear(bed.position.x, bed.position.y, bed.position.z, 1));
+          // Use the shared navigation manager so bed travel gets the same stuck
+          // detection, escape candidates and replan handling as follow/PvP.
+          nav.goto(bed.position.x, bed.position.y, bed.position.z, 1);
         } catch (e) {
           ctx.sleepNavigating = false;
           sleepBedKey = null;
+          resumeModeAfterSleep();
+          log("bed navigation error: " + e.message);
         }
       }
       return;
     }
 
     sleepAttempt = true;
-    ctx.sleepNavigating = true; // keep anti-AFK movement from interrupting the sleep action
-    sleepBedKey = null;
+    ctx.sleepNavigating = true;
+    sleepBedKey = bedKey;
     try {
-      bot.pathfinder.setGoal(null);
-      await bot.sleep(bed);
-      say("Sleeping now.");
+      nav.stop();
+      const freshBed = bot.blockAt(bed.position) || bed;
+      await bot.sleep(freshBed);
+      say("Sleeping now. I'll resume my previous task when I wake.");
     } catch (e) {
-      // Server may deny sleep because it is not quite night or monsters are nearby.
       ctx.sleepNavigating = false;
+      sleepBedKey = null;
+      // Avoid suspending/resuming the active job every five seconds when the
+      // server refuses sleep because a hostile mob is nearby or it is not yet
+      // valid to sleep. Retry at a calmer 30-second interval.
+      sleepRetryAfter = Date.now() + 30000;
+      if (now - lastSleepErrorNotice > 30000) {
+        lastSleepErrorNotice = now;
+        say("I found a bed but couldn't sleep: " + String(e.message || e).slice(0, 120));
+      }
+      resumeModeAfterSleep();
     } finally {
       sleepAttempt = false;
     }
@@ -331,6 +435,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
   bot.on("wake", () => {
     ctx.sleepNavigating = false;
     sleepBedKey = null;
+    resumeModeAfterSleep();
   });
 
   async function dropAllInventory() {
@@ -384,8 +489,13 @@ function initCommands(bot, mcData, defaultMove, deps) {
 
   function startMode(mode, owner) {
     stopMode(true);
+    // A manually-issued new task supersedes any task saved before an earlier
+    // sleep interruption. The next sleep cycle will save this new task instead.
+    sleepResumeState = null;
     ctx.sleepNavigating = false;
     sleepBedKey = null;
+    if (mode !== "wood") currentWoodLimit = 0;
+    if (bot.isSleeping) bot.wake().catch(() => {});
     ctx.mode = mode;
     ctx.owner = owner || null;
     try {
@@ -411,6 +521,8 @@ function initCommands(bot, mcData, defaultMove, deps) {
   function stopMode(silent) {
     ctx.token++; // cancels async loops (wood, pickup)
     ctx.mode = "idle";
+    ctx.sleepNavigating = false;
+    sleepBedKey = null;
     ctx.owner = null;
     ctx.pickup = false;
     killState.target = null;
@@ -441,7 +553,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
 
   // keeps the bot on its fixed position while idle
   addInterval(() => {
-    if (ctx.mode !== "idle" || !ctx.home || ctx.eating || !bot.entity) return;
+    if (ctx.mode !== "idle" || ctx.sleepNavigating || !ctx.home || ctx.eating || !bot.entity) return;
     const p = bot.entity.position;
     const h = ctx.home;
     const d = Math.hypot(p.x - (h.x + 0.5), p.z - (h.z + 0.5)) + Math.abs(p.y - h.y) * 0.5;
@@ -840,10 +952,11 @@ function initCommands(bot, mcData, defaultMove, deps) {
   function run(name, args, username) {
     switch (name) {
       case "help":
-        say("!wood [n] !follow !kill !killstatus !guard !unguard !pvp [name] !sleep !armor !inventory !pathstatus !radius !unsave !stop");
+        say("!wood [n] !follow !kill !killstatus !guard !unguard !pvp [name] !sleep !sleepstatus !armor !inventory !pathstatus !radius !unsave !stop");
         return;
 
       case "stop":
+        sleepResumeState = null; // an explicit stop must not be undone after waking
         stopMode(false);
         say("Stopped.");
         return;
@@ -872,22 +985,31 @@ function initCommands(bot, mcData, defaultMove, deps) {
       case "sleep": {
         ctx.autoSleep = !ctx.autoSleep;
         if (ctx.autoSleep) {
-          say("Auto-sleep enabled. I'll look for a nearby bed at night. Type !sleep again to disable it.");
+          sleepRetryAfter = 0;
+          const timeOfDay = worldTimeOfDay();
+          say("Auto-sleep enabled. Minecraft time is " + (timeOfDay === null ? "unknown" : Math.floor(timeOfDay)) +
+            (timeOfDay !== null && isNight() ? " (night)" : " (daytime; I'll sleep when night starts)") +
+            ". I'll search up to " + BED_SEARCH_RADIUS + " blocks for a placed bed. Use !sleepstatus for details; !sleep again disables it.");
           autoSleepTick().catch((e) => log("auto-sleep error: " + e.message));
         } else {
           const wasSleepNavigating = ctx.sleepNavigating;
           ctx.sleepNavigating = false;
           sleepBedKey = null;
           try {
-            // Only clear the pathfinder goal when it belongs to auto-sleep.
-            if (wasSleepNavigating && ctx.mode === "idle") {
-              bot.pathfinder.setGoal(null);
-              if (ctx.home) goHome();
-            }
-            if (bot.isSleeping) bot.wake().catch(() => {});
+            if (wasSleepNavigating) nav.stop();
+            if (bot.isSleeping) bot.wake().catch(() => resumeModeAfterSleep());
+            else resumeModeAfterSleep();
+            if (!sleepResumeState && ctx.mode === "idle" && ctx.home) goHome();
           } catch (e) {}
           say("Auto-sleep disabled.");
         }
+        return;
+      }
+
+      case "sleepstatus": {
+        const details = sleepStatusText();
+        log("sleepstatus: " + details);
+        say("Sleep status: " + details);
         return;
       }
 
@@ -937,6 +1059,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
           return;
         }
         const limit = parseInt(args[0], 10) || 0;
+        currentWoodLimit = limit;
         const token = startMode("wood", username);
         say("Chopping trees" + (limit ? " (" + limit + " logs)" : "") + ".");
         woodLoop(token, limit).catch((e) => {
