@@ -77,3 +77,61 @@ This build responds to the supplied screenshot of the bot stopped beside a villa
 - Empty scans no longer stop kill mode after ~3 seconds; the bot keeps scanning while the command remains enabled and reports when no eligible entity is currently tracked.
 - A target disappearing from `bot.entities` is treated as despawn/untracking, not a confirmed kill. Only `entityDead` increments the kill counter and starts drop pickup.
 - Added `!killstatus` to report the current target, distance, eligible tracked-entity count/names, and confirmed kills.
+
+
+# Adaptive pathfinding update v9
+
+This update responds to the two newest screenshots: the bot remained on a lower terrace beneath a raised hillside/structure instead of finding a route to the player's higher position.
+
+## Main changes
+
+- Kept the official `mineflayer-pathfinder` A* engine and pinned the project dependency to `^2.4.5` (the lockfile already resolves 2.4.5). No unverified third-party pathfinder fork was substituted.
+- Re-enabled the official planner's native parkour moves and sprinting for both normal navigation and woodcutting. The prior builds had explicitly disabled both, which removed useful jumps over gaps and uneven ledges.
+- Re-enabled 1x1 scaffolding towers in normal follow/combat navigation while keeping `canDig=false`. This lets the bot climb out of terrain pockets without mining through player structures; it only towers when a supported scaffold item is in its inventory.
+- Reduced `liquidCost` from 1000 to 6 so water is strongly disfavored but is not treated like an impossible route. The unused `fallDamageCost` setting was removed; official Movements options use `maxDropDown` and `infiniteLiquidDropdownDistance` instead.
+- Kept the wood profile separate: it can clear leaves and tower, but protected blocks still prevent it from digging through common house/building materials.
+- Removed the lower-body raycast from the follow endpoint test. It could reject walkable nodes near grass ledges and slabs. Follow endpoints now need only an eye-to-torso line of sight; combat still checks its own melee/shot visibility before attacking.
+- Changed follow/guard approach ranges to tolerate height differences, and kept melee approach close enough to enter hit range.
+- Reworked the navigation watchdog to distinguish `pending`, `partial`, `ready`, and `failed` A* results. It no longer cancels the planner after 3.2 seconds while a complex search is still running. It records actual body displacement during partial routes and only declares a route stalled after the configured think timeout plus a grace period, or after a ready route has made no progress for 7–9.5 seconds.
+- Expanded `!pathstatus` output to include planner state, latest result status, route age, no-progress time and escape count.
+
+## Why not the separate human-walking controller or a third-party fork?
+
+The current upstream `createHuman()` controller is for following already-planned walking routes; the official documentation says it does not dig, place, swim or parkour. Those are required by this bot's terrain and woodcutting tasks, so it is not a replacement for A*. The alternative fork also has a different API and would require rewriting the bot's command/combat navigation integration.
+
+## Validation
+
+- `npm test` passes (JavaScript syntax checks and JSON parsing).
+- A focused mock test checks that a still-pending planner is not cancelled by the old 3.2-second watchdog and that a successful route transitions the navigation status to ready.
+- No live Aternos connection was available. The new `!pathstatus` output should be used to capture the next in-game route result if it still stalls.
+
+# Advanced navigation upgrade v10
+
+This version upgrades the navigation behavior rather than only adding more watchdog resets.
+
+## Pathfinder engine compatibility/backports
+
+- The installer backports the upstream path invalidation guard from PrismarineJS/mineflayer-pathfinder PR #386 directly into the pathfinder executor: it tracks a `pathRevision`, increments it whenever the path is reset/stopped, and discards a just-computed A* result if a synchronous `path_update` listener invalidated it. `pathfinder-compat.js` is a runtime fallback only when the installed source does not match the patcher.
+- Added an automatic package patcher (`scripts/patch-pathfinder.js`, run at `postinstall` and before the pathfinder plugin is loaded). It backports the partial-search continuation changes from PR #399 to `index.js` and `lib/goto.js`, so a timed-out A* search can walk its best partial route and continue searching instead of stopping at the partial endpoint.
+- The same patcher applies the pillar placement hitbox timing from PR #400. It waits for the bot's feet to clear the scaffold block and equips while rising, avoiding server rejection of a block placed inside the player hitbox.
+- The published npm version of `mineflayer-pathfinder` remains 2.4.5; 2.5.0 has not been released. These targeted compatibility fixes are backported locally instead of depending on an unreleased package version.
+
+## Smarter goal approach
+
+- Follow/combat goals now check visibility against multiple target hitbox heights rather than only a single torso ray.
+- On `noPath`, timeout, or stuck reset, the controller widens the acceptable visible approach radius in stages up to 9 blocks. Once it reaches an outer visible waypoint, it tries a closer stage again; ranges that already failed for this target are skipped to avoid endless oscillation.
+- When a moving target travels more than one block, the staged approach cache resets and A* replans from the bot's current position.
+- `!pathstatus` now reports the current approach radius and the original requested radius.
+
+## Hybrid terrain movement
+
+- Normal follow/combat movement can dig only a high-cost whitelist of soft natural terrain and foliage (leaves, grass/ferns, dirt-like blocks, sand/gravel/clay, and similar listed natural blocks). This gives A* another route through natural hills and shallow trenches when parkour/towering cannot find a path.
+- All non-whitelisted blocks are added to `blocksCantBreak` for the normal movement profile. This protects common building materials, stone, paths, containers, ores, logs, doors and gates from routine path excavation.
+- Digging is deliberately expensive (`digCost=8`) so it is a last resort after walking, parkour and scaffolding. The dedicated wood profile remains more permissive but keeps its structural protections.
+- Think timeout increased to 22 seconds for complex hillside searches.
+
+## Validation
+
+- `npm test` passes: syntax checks, settings JSON parse, navigation goal regression test, stale-path invalidation regression test, and source-patch fixture tests.
+- The actual installed `node_modules` is not included in this ZIP. The patcher runs during `npm install` and again before the pathfinder module is loaded at startup; it logs whether each upstream backport matched the installed source.
+- Not yet tested on the live Aternos world. Server permissions can still reject digging or placement, and dirt/sand/gravel terrain is intentionally breakable as a last-resort movement option. Check `!pathstatus` and the startup `[Pathfinder patch]` messages if the bot still stalls.

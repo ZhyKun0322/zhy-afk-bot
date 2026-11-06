@@ -222,7 +222,7 @@ function createPvp(bot, deps) {
     // Keep a close follow goal so the pathfinder can move around the obstacle.
     if (!U.hasLineOfSight(bot, target)) {
       cancelDraw();
-      nav.follow(target, 1.1);
+      nav.follow(target, 2.0);
       return;
     }
 

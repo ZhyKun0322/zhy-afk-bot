@@ -1,11 +1,12 @@
 {
   "name": "minecraft-afk-bot",
-  "version": "2.2",
-  "description": "Robust AFK bot for Minecraft servers with infinite uptime.",
+  "version": "2.3",
+  "description": "Robust AFK bot for Minecraft servers with hybrid terrain-aware navigation and pathfinder backports.",
   "main": "index.js",
   "scripts": {
     "start": "node index.js",
-    "test": "node --check index.js && node --check commands.js && node --check pvp.js && node --check combatUtils.js && node -e \"JSON.parse(require('fs').readFileSync('settings.json', 'utf8'))\""
+    "postinstall": "node scripts/patch-pathfinder.js",
+    "test": "node --check index.js && node --check commands.js && node --check pvp.js && node --check combatUtils.js && node --check pathfinder-compat.js && node --check scripts/patch-pathfinder.js && node -e \"JSON.parse(require('fs').readFileSync('settings.json', 'utf8'))\" && node test/pathfinding-nav.test.js && node test/pathfinder-compat.test.js && node test/pathfinder-patch.test.js"
   },
   "author": "Lamgerr",
   "license": "MIT",
@@ -13,6 +14,6 @@
     "express": "^4.18.1",
     "minecraft-data": "^3.103.0",
     "mineflayer": "^4.34.0",
-    "mineflayer-pathfinder": "^2.1.1"
+    "mineflayer-pathfinder": "^2.4.5"
   }
 }

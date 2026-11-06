@@ -755,7 +755,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
       }
       return;
     }
-    nav.follow(ent, 1.1);
+    nav.follow(ent, 2.25);
   }
 
   // ============================================================
@@ -785,7 +785,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
       melee.step(threat, { crit: false, prefer: "sword" });
     } else {
       melee.release();
-      nav.follow(player, 1.1);
+      nav.follow(player, 2.25);
     }
   }
 
@@ -911,9 +911,16 @@ function initCommands(bot, mcData, defaultMove, deps) {
         const pos = bot.entity && bot.entity.position;
         const goal = bot.pathfinder && bot.pathfinder.goal;
         const path = bot.pathfinder && Array.isArray(bot.pathfinder.path) ? bot.pathfinder.path : [];
+        const planner = typeof nav.status === "function" ? nav.status() : {};
         const details = "mode=" + ctx.mode +
           ", goal=" + (goal ? (goal.constructor && goal.constructor.name || "active") : "none") +
           ", nodes=" + path.length +
+          ", route=" + (planner.routeState || "unknown") +
+          ", result=" + (planner.lastPathStatus || "unknown") +
+          ", routeAge=" + Math.round((planner.routeAgeMs || 0) / 1000) + "s" +
+          ", noProgress=" + Math.round((planner.noProgressMs || 0) / 1000) + "s" +
+          ", escapes=" + (planner.escapes || 0) +
+          (Number.isFinite(planner.approachRange) ? ", approach=" + planner.approachRange.toFixed(1) + "/" + planner.baseApproachRange.toFixed(1) : "") +
           ", moving=" + !!(bot.pathfinder && bot.pathfinder.isMoving && bot.pathfinder.isMoving()) +
           ", mining=" + !!(bot.pathfinder && bot.pathfinder.isMining && bot.pathfinder.isMining()) +
           ", building=" + !!(bot.pathfinder && bot.pathfinder.isBuilding && bot.pathfinder.isBuilding()) +

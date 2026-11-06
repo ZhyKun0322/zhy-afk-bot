@@ -1,6 +1,10 @@
 "use strict";
 
 const { addLog, getLogs } = require("./logger");
+// Patch the installed pathfinder before loading it. This is also run from
+// postinstall, but doing it here covers hosts that upload files without a
+// fresh npm install after the upgrade.
+const pathfinderPatchStatus = require("./scripts/patch-pathfinder").patchInstalledPathfinder();
 const mineflayer = require("mineflayer");
 const { Movements, pathfinder, goals } = require("mineflayer-pathfinder");
 const { GoalBlock } = goals;
@@ -8,6 +12,7 @@ const { Vec3 } = require("vec3");
 const config = require("./settings.json");
 const cmd = require("./commands");
 const { isHostile } = require("./combatUtils");
+const { installPathUpdateInvalidationGuard } = require("./pathfinder-compat");
 const express = require("express");
 const http = require("http");
 const https = require("https");
@@ -57,11 +62,9 @@ function installGoalLookAtBlockReachFix() {
   proto.__overheadReachFix = true;
 }
 
-// Do not wrap bot.placeBlock for pillar movement. The previous custom wrapper
-// waited for the bot to rise more than two blocks above the reference block;
-// depending on the pathfinder's reference face this can never happen during a
-// normal jump and causes every scaffold placement to time out. Use Mineflayer's
-// native placement implementation and let pathfinder handle the jump timing.
+// Pillar timing is patched in mineflayer-pathfinder itself at postinstall.
+// It waits until the player's feet clear the scaffold block and equips while
+// rising, preventing vanilla servers from rejecting a block inside the player.
 
 installGoalLookAtBlockReachFix();
 
@@ -1564,6 +1567,13 @@ function createBot() {
     });
 
     bot.loadPlugin(pathfinder);
+    // Backport the upstream path_update invalidation fix: recovery listeners
+    // may replace goals during a path_update callback, and old pathfinder
+    // builds can otherwise install the stale result after the callback.
+    if (!pathfinderPatchStatus || !["patched", "already-patched"].includes(pathfinderPatchStatus.invalidation)) {
+      installPathUpdateInvalidationGuard(bot);
+      addLog("[Pathfinder patch] Internal invalidation patch unavailable; runtime compatibility guard enabled.");
+    }
 
     // FIX: connection timeout - end the old bot before reconnecting to avoid ghost bots
     clearBotTimeouts();
@@ -1621,29 +1631,39 @@ function createBot() {
       const mcData = require("minecraft-data")(bot.version);
       const defaultMove = new Movements(bot, mcData);
       defaultMove.allowFreeMotion = false;
-      // Safe profile for following, combat, guarding and ordinary movement:
-      // never try to mine through houses, protected plots or solid walls.
-      // Route around them instead of repeatedly issuing a server-rejected dig.
-      defaultMove.canDig = false;
-      defaultMove.liquidCost = 1000;
-      defaultMove.fallDamageCost = 1000;
-      defaultMove.allow1by1towers = false;
-      defaultMove.allowParkour = false;
-      defaultMove.allowSprinting = false;
+      // Adaptive safe-navigation profile for follow, combat, guard and normal
+      // movement. It never mines through buildings, but it can use native
+      // parkour, sprint-jumps, water routes and 1x1 scaffolding to climb ledges
+      // or escape shallow trenches when suitable blocks are in the inventory.
+      // Hybrid terrain profile: A* may break selected natural soft blocks only
+      // (leaves/foliage and dirt-like terrain) at a high cost as a last resort.
+      // All other blocks are placed in blocksCantBreak below, including common
+      // house materials, containers, ores and logs.
+      defaultMove.canDig = true;
+      defaultMove.digCost = 8.0;
+      defaultMove.liquidCost = 5; // prefer land, but water is not an impassable wall
+      defaultMove.maxDropDown = 4;
+      defaultMove.infiniteLiquidDropdownDistance = true;
+      defaultMove.allow1by1towers = true;
+      defaultMove.allowParkour = true;
+      defaultMove.allowSprinting = true;
+      defaultMove.allowEntityDetection = true;
 
-      // Dedicated wood profile: clear foliage and tower only while harvesting.
-      // Structural blocks are protected below so the bot will not cut through
-      // village houses, fences, paths or player builds to reach a tree.
+      // Dedicated wood profile: clear foliage, parkour and tower when required.
+      // Structural blocks and non-natural blocks are protected below so it will
+      // not mine houses/paths. Default movement can only clear soft natural terrain.
       const woodMove = new Movements(bot, mcData);
       woodMove.allowFreeMotion = false;
       woodMove.canDig = true;
-      woodMove.digCost = 1.25;
-      woodMove.liquidCost = 1000;
-      woodMove.fallDamageCost = 1000;
+      woodMove.digCost = 1.0;
+      woodMove.liquidCost = 6;
+      woodMove.maxDropDown = 4;
+      woodMove.infiniteLiquidDropdownDistance = true;
       woodMove.allow1by1towers = true;
-      woodMove.allowParkour = false;
-      woodMove.allowSprinting = false;
-      bot.pathfinder.thinkTimeout = 15000;
+      woodMove.allowParkour = true;
+      woodMove.allowSprinting = true;
+      woodMove.allowEntityDetection = true;
+      bot.pathfinder.thinkTimeout = 22000;
       if (defaultMove.blocksCantBreak && mcData.blocksByName) {
         const protectedNames = [
           'bedrock','barrier','end_portal_frame','end_portal','nether_portal',
@@ -1702,21 +1722,34 @@ function createBot() {
       ]);
       if (woodMove.blocksCantBreak && mcData.blocksArray) {
         const leafIds = new Set();
+        const defaultDiggable = /(_leaves$|^(short_grass|tall_grass|fern|large_fern|dead_bush|vine|glow_lichen|hanging_roots|cave_vines|cave_vines_plant|seagrass|tall_seagrass|kelp|kelp_plant|dirt|grass_block|coarse_dirt|rooted_dirt|podzol|mycelium|mud|gravel|sand|red_sand|clay|snow_block)$)/;
         for (const block of mcData.blocksArray) {
           const name = String(block.name || "");
           if (name.endsWith("_leaves")) leafIds.add(block.id);
           if (structuralNames.has(name) || structuralPatterns.some((pattern) => pattern.test(name))) {
             woodMove.blocksCantBreak.add(block.id);
           }
+          // The general profile is deliberately more conservative than the
+          // woodcutting profile: only common soft natural terrain/vegetation
+          // may be cleared. Every other registered block is protected.
+          if (defaultMove.blocksCantBreak && !defaultDiggable.test(name)) {
+            defaultMove.blocksCantBreak.add(block.id);
+          }
         }
-        // Leaves are specifically allowed to be cleared by the wood profile.
+        // Allow leaves to be cleared by both profiles; all non-leaf blocks in
+        // the normal profile remain protected unless listed in defaultDiggable.
         for (const id of leafIds) {
           woodMove.blocksCantBreak.delete(id);
           if (woodMove.blocksToAvoid) woodMove.blocksToAvoid.delete(id);
+          if (defaultMove.blocksCantBreak) defaultMove.blocksCantBreak.delete(id);
+          if (defaultMove.blocksToAvoid) defaultMove.blocksToAvoid.delete(id);
         }
-        if (leafIds.size && typeof woodMove.safeToBreak === "function") {
-          const originalSafeToBreak = woodMove.safeToBreak.bind(woodMove);
-          woodMove.safeToBreak = function (block) {
+        // Leaves can be adjacent to water. Preserve Mineflayer's normal safety
+        // checks, but permit the foliage dig while avoiding fluid-flow stalls.
+        for (const movement of [defaultMove, woodMove]) {
+          if (!leafIds.size || typeof movement.safeToBreak !== "function") continue;
+          const originalSafeToBreak = movement.safeToBreak.bind(movement);
+          movement.safeToBreak = function (block) {
             if (block && leafIds.has(block.type)) {
               const oldDontCreateFlow = this.dontCreateFlow;
               this.dontCreateFlow = false;
@@ -1726,7 +1759,7 @@ function createBot() {
             return originalSafeToBreak(block);
           };
         }
-        addLog(`[Pathfinder] Wood profile: foliage clearing enabled for ${leafIds.size} leaf block types; structural blocks protected.`);
+        addLog(`[Pathfinder] Hybrid terrain profile: default may clear only whitelisted soft terrain and foliage (digCost=${defaultMove.digCost}); wood profile clears foliage and protected non-structural natural blocks; buildings/ores/containers protected.`);
       }
       if (Array.isArray(woodMove.scafoldingBlocks)) {
         for (const name of [
@@ -1741,12 +1774,12 @@ function createBot() {
           if (item && !woodMove.scafoldingBlocks.includes(item.id)) woodMove.scafoldingBlocks.push(item.id);
         }
       }
-      addLog(`[Pathfinder] ${bot.version}: normal canDig=${defaultMove.canDig}, wood canDig=${woodMove.canDig}, wood towers=${woodMove.allow1by1towers}, scaffold=${(woodMove.scafoldingBlocks || []).length}`);
+      addLog(`[Pathfinder] ${bot.version}: hybrid(canDig=${defaultMove.canDig}, digCost=${defaultMove.digCost}, parkour=${defaultMove.allowParkour}, sprint=${defaultMove.allowSprinting}, towers=${defaultMove.allow1by1towers}, liquidCost=${defaultMove.liquidCost}) wood(canDig=${woodMove.canDig}, parkour=${woodMove.allowParkour}, sprint=${woodMove.allowSprinting}, towers=${woodMove.allow1by1towers}, liquidCost=${woodMove.liquidCost})`);
       configureDoorAwareMovements(bot, defaultMove);
       configureDoorAwareMovements(bot, woodMove);
       installPathfinderCollisionFixes(bot, defaultMove);
       installPathfinderCollisionFixes(bot, woodMove);
-      addLog("[Pathfinder] Safe navigation profile and protected woodcutting profile enabled.");
+      addLog("[Pathfinder] Hybrid A* movement enabled: parkour, sprint-jumps, water routes, safe scaffolding, and high-cost soft-terrain clearing; structures and valuable blocks remain protected.");
       let lastPathDiagnosticAt = 0;
       bot.on("path_reset", (reason) => {
         if (!["stuck", "no_scaffolding_blocks", "place_error", "dig_error"].includes(reason)) return;

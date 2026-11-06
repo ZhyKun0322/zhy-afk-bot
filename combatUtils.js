@@ -274,57 +274,119 @@ function createNav(bot) {
   let lastEscapeAt = 0;
   let escapeCount = 0;
   let escapeInProgress = false;
+  let escapeRetryTimer = null;
   let recoverySwappingGoal = false;
   let cancelGoalPromise = null;
   let lastProgressPosition = null;
   let lastProgressAt = Date.now();
+  let movementObserved = false;
   let missingGoalSince = 0;
   let busyActionSince = 0;
+  // Do not run the stuck watchdog while A* is still calculating. The old
+  // 3.2-second timer could cancel a valid search long before thinkTimeout.
+  let routeState = "idle"; // idle | pending | partial | ready | failed
+  let routeStateAt = Date.now();
+  let lastPathStatus = "idle";
+  let lastPathNodeCount = 0;
 
+  // Dynamic, staged approach goal. It first seeks a close, visible position;
+  // if terrain makes that impossible it expands the acceptable distance in
+  // small steps, reaches a visible waypoint, then tries a closer stage again.
+  // This prevents a one-block ridge / cave lip from being treated as a hard
+  // no-path condition while still trying to close distance for melee combat.
   function followGoal(entity, range) {
     const goal = new goals.GoalFollow(entity, range);
     const originalIsEnd = goal.isEnd.bind(goal);
-    // GoalFollow normally uses only Euclidean distance. That lets it report
-    // "arrived" when the player is close on the other side of a house wall.
-    // Require both a body-height corridor and eye line-of-sight from the
-    // candidate node before accepting the node as the follow destination.
-    goal.isEnd = (node) => {
-      if (!originalIsEnd(node) || !entity.position || !bot.world) return false;
-      try {
-        const candidateFeet = new Vec3(node.x + 0.5, node.y, node.z + 0.5);
-        const targetFeet = entity.position;
-        const fromBody = candidateFeet.offset(0, 0.35, 0);
-        const toBody = targetFeet.offset(0, 0.35, 0);
-        const bodyDelta = toBody.minus(fromBody);
-        const bodyDistance = bodyDelta.norm();
-        if (bodyDistance > 0.6) {
-          const bodyHit = bot.world.raycast(fromBody, bodyDelta.normalize(), bodyDistance);
-          if (bodyHit) return false;
-        }
+    const baseRange = Math.max(1.25, Number(range) || 2);
+    const maxRange = Math.min(9, baseRange + 7);
+    goal.__smartBaseRange = baseRange;
+    goal.__smartRange = baseRange;
+    goal.__smartMaxRange = maxRange;
+    goal.__smartFailedRanges = new Set();
+    goal.__smartLastRefineAt = 0;
 
-        const fromEyes = candidateFeet.offset(0, bot.entity.height || 1.62, 0);
-        const toEyes = targetFeet.offset(0, (entity.height || 1.8) * 0.6, 0);
-        const eyeDelta = toEyes.minus(fromEyes);
-        const eyeDistance = eyeDelta.norm();
-        if (eyeDistance > 0.6) {
-          const eyeHit = bot.world.raycast(fromEyes, eyeDelta.normalize(), eyeDistance);
-          if (eyeHit) return false;
+    const applyRange = (next) => {
+      const value = Math.max(baseRange, Math.min(maxRange, Number(next)));
+      goal.range = value;
+      goal.rangeSq = value * value;
+      goal.__smartRange = value;
+    };
+    goal.__smartExpandRange = () => {
+      goal.__smartFailedRanges.add(Number(goal.__smartRange.toFixed(2)));
+      let next = Math.min(maxRange, goal.__smartRange + 1.5);
+      while (next > goal.__smartRange + 0.001) {
+        const value = Number(next.toFixed(2));
+        if (!goal.__smartFailedRanges.has(value)) {
+          applyRange(value);
+          return true;
         }
-        return true;
+        if (value >= maxRange) break;
+        next = Math.min(maxRange, next + 1.5);
+      }
+      return false;
+    };
+    goal.__smartRefineRange = (now) => {
+      if (goal.__smartRange <= baseRange + 0.01 || now - goal.__smartLastRefineAt < 1200) return false;
+      goal.__smartLastRefineAt = now;
+      for (let next = goal.__smartRange - 1.5; next >= baseRange - 0.001; next -= 1.5) {
+        const value = Number(Math.max(baseRange, next).toFixed(2));
+        if (!goal.__smartFailedRanges.has(value)) {
+          applyRange(value);
+          return true;
+        }
+      }
+      return false;
+    };
+    goal.__smartReset = () => {
+      goal.__smartFailedRanges.clear();
+      applyRange(baseRange);
+    };
+
+    goal.isEnd = (node) => {
+      if (!originalIsEnd(node) || !entity.position || !bot.world || !bot.entity) return false;
+      try {
+        const fromEyes = new Vec3(node.x + 0.5, node.y + (bot.entity.height || 1.62) * 0.9, node.z + 0.5);
+        const targetHeight = entity.height || 1.8;
+        // A single torso ray is overly strict around grass edges, slabs and
+        // uneven cave entrances. Any clear ray to a sensible hitbox sample is
+        // a valid approach point; melee still performs its own body-lane test.
+        const targetSamples = [0.35, Math.min(targetHeight * 0.55, 1.0), Math.max(0.3, targetHeight - 0.2)];
+        for (const sampleY of targetSamples) {
+          const targetPoint = entity.position.offset(0, sampleY, 0);
+          const delta = targetPoint.minus(fromEyes);
+          const distance = delta.norm();
+          if (distance <= 0.35 || !bot.world.raycast(fromEyes, delta.normalize(), distance)) return true;
+        }
+        return false;
       } catch (e) {
-        // If the world raycast cannot be evaluated (e.g. an unloaded edge),
-        // stay conservative and keep navigating rather than stopping early.
+        // Unknown/unloaded raycasts should not be treated as proof of arrival.
         return false;
       }
     };
     return goal;
   }
 
+  function expandSmartGoal(goal, reason) {
+    if (!goal || typeof goal.__smartExpandRange !== "function") return false;
+    if (!goal.__smartExpandRange()) return false;
+    console.warn(`[Pathfinder] Smart approach widened to ${goal.__smartRange.toFixed(1)} blocks after ${reason}; will tighten again when a visible waypoint is reached.`);
+    return true;
+  }
+
   function setActiveGoal(goal, dynamic = false) {
+    if (escapeRetryTimer) {
+      clearTimeout(escapeRetryTimer);
+      escapeRetryTimer = null;
+    }
     activeGoal = { goal, dynamic };
     lastProgressPosition = bot.entity && bot.entity.position ? bot.entity.position.clone() : null;
     lastProgressAt = Date.now();
+    movementObserved = false;
     missingGoalSince = 0;
+    routeState = "pending";
+    routeStateAt = Date.now();
+    lastPathStatus = "pending";
+    lastPathNodeCount = 0;
     bot.pathfinder.setGoal(goal, dynamic);
   }
 
@@ -412,10 +474,30 @@ function createNav(bot) {
     return candidates;
   }
 
+  function scheduleEscapeRetry(delay) {
+    if (escapeRetryTimer || escapeInProgress) return;
+    escapeRetryTimer = setTimeout(() => {
+      escapeRetryTimer = null;
+      escapeBlockedNode();
+    }, Math.max(250, delay));
+  }
+
   function escapeBlockedNode() {
     const now = Date.now();
-    if (escapeInProgress || !activeGoal || !bot.entity || now - lastEscapeAt < 5000) return;
-    if (bot.pathfinder.isMining() || bot.pathfinder.isBuilding()) return;
+    if (escapeInProgress || !activeGoal || !bot.entity) return;
+    const cooldownRemaining = 5000 - (now - lastEscapeAt);
+    if (cooldownRemaining > 0) {
+      scheduleEscapeRetry(cooldownRemaining);
+      return;
+    }
+    if ((bot.pathfinder.isMining && bot.pathfinder.isMining()) || (bot.pathfinder.isBuilding && bot.pathfinder.isBuilding())) {
+      scheduleEscapeRetry(1000);
+      return;
+    }
+    if (escapeRetryTimer) {
+      clearTimeout(escapeRetryTimer);
+      escapeRetryTimer = null;
+    }
 
     const goalSnapshot = activeGoal;
     const candidates = findSafeEscapeTiles(goalSnapshot.goal);
@@ -455,6 +537,11 @@ function createNav(bot) {
         try {
           lastProgressPosition = bot.entity.position.clone();
           lastProgressAt = Date.now();
+          movementObserved = false;
+          routeState = "pending";
+          routeStateAt = Date.now();
+          lastPathStatus = "recovery_replan";
+          lastPathNodeCount = 0;
           bot.pathfinder.setGoal(goalSnapshot.goal, goalSnapshot.dynamic);
         } catch (e) {
           key = null;
@@ -505,19 +592,87 @@ function createNav(bot) {
     tryNextCandidate();
   }
 
+  const onGoalUpdated = () => {
+    if (recoverySwappingGoal || escapeInProgress || !activeGoal) return;
+    routeState = "pending";
+    routeStateAt = Date.now();
+    lastPathStatus = "goal_updated";
+    lastPathNodeCount = 0;
+    lastProgressPosition = bot.entity && bot.entity.position ? bot.entity.position.clone() : null;
+    lastProgressAt = Date.now();
+    movementObserved = false;
+    missingGoalSince = 0;
+  };
+
   const onPathReset = (reason) => {
-    // `stuck` is the normal movement failure; digging/placing failures can
-    // leave the same active goal stranded and deserve the same recovery path.
+    const now = Date.now();
     if (["stuck", "dig_error", "place_error", "no_scaffolding_blocks"].includes(reason)) {
-      escapeBlockedNode();
+      if (!escapeInProgress) {
+        routeState = "failed";
+        routeStateAt = now;
+        lastPathStatus = reason;
+        if (activeGoal && expandSmartGoal(activeGoal.goal, reason)) {
+          routeState = "pending";
+          routeStateAt = now;
+          lastPathStatus = "smart_range_expand";
+          lastPathNodeCount = 0;
+          try { bot.pathfinder.setGoal(activeGoal.goal, activeGoal.dynamic); } catch (e) { escapeBlockedNode(); }
+        } else {
+          escapeBlockedNode();
+        }
+      }
+      return;
+    }
+    // World/chunk/goal changes invalidate the previous route. Wait for the
+    // next path_update before deciding whether the bot itself is stalled.
+    if (["goal_updated", "goal_moved", "block_updated", "chunk_loaded", "movements_updated"].includes(reason) && !recoverySwappingGoal && !escapeInProgress) {
+      routeState = "pending";
+      routeStateAt = now;
+      lastPathStatus = reason;
+      lastPathNodeCount = 0;
     }
   };
+
   const onPathUpdate = (result) => {
-    // noPath/timeout are path_update statuses, NOT path_reset reasons. v5 did
-    // not listen for these, so follow/PvP could silently keep a dead goal key.
-    if (!result || !["noPath", "timeout"].includes(result.status)) return;
-    if (!escapeInProgress) escapeBlockedNode();
+    if (!result || recoverySwappingGoal || escapeInProgress) return;
+    const now = Date.now();
+    const status = String(result.status || "unknown");
+    const resultLength = Array.isArray(result.path) ? result.path.length : 0;
+    const liveLength = bot.pathfinder && Array.isArray(bot.pathfinder.path) ? bot.pathfinder.path.length : 0;
+    lastPathStatus = status;
+    lastPathNodeCount = resultLength || liveLength;
+
+    if (status === "success") {
+      routeState = "ready";
+      routeStateAt = now;
+      if (!movementObserved) {
+        lastProgressPosition = bot.entity && bot.entity.position ? bot.entity.position.clone() : lastProgressPosition;
+        lastProgressAt = now;
+      }
+      return;
+    }
+    if (status === "partial") {
+      // Partial results may be walkable while the planner continues. Preserve
+      // the original start time and progress clock across repeated partials.
+      if (routeState !== "partial" && routeState !== "ready") routeStateAt = now;
+      routeState = "partial";
+      return;
+    }
+    if (status === "noPath" || status === "timeout") {
+      routeState = "failed";
+      routeStateAt = now;
+      if (activeGoal && expandSmartGoal(activeGoal.goal, status)) {
+        routeState = "pending";
+        routeStateAt = now;
+        lastPathStatus = "smart_range_expand";
+        lastPathNodeCount = 0;
+        try { bot.pathfinder.setGoal(activeGoal.goal, activeGoal.dynamic); } catch (e) { escapeBlockedNode(); }
+      } else if (activeGoal) {
+        escapeBlockedNode();
+      }
+    }
   };
+
   const onPhysicsTick = () => {
     if (!bot.entity || !activeGoal || escapeInProgress) return;
     const now = Date.now();
@@ -538,20 +693,24 @@ function createNav(bot) {
         } catch (e) {}
         setTimeout(() => {
           if (activeGoal === snapshot && bot.entity) {
+            routeState = "pending";
+            routeStateAt = Date.now();
+            lastPathStatus = "busy_action_retry";
+            lastPathNodeCount = 0;
             try { bot.pathfinder.setGoal(snapshot.goal, snapshot.dynamic); } catch (e) {}
           }
           recoverySwappingGoal = false;
           busyActionSince = 0;
           lastProgressPosition = bot.entity ? bot.entity.position.clone() : null;
           lastProgressAt = Date.now();
+          movementObserved = false;
         }, 250);
         busyActionSince = now;
       }
       return;
     }
     busyActionSince = 0;
-    // A dynamic GoalFollow remains active when its target is in range. Static
-    // goals can also complete on this tick, so don't mistake arrival for a jam.
+
     let reached = false;
     try {
       reached = !!(activeGoal.goal && typeof activeGoal.goal.isEnd === "function" &&
@@ -561,19 +720,27 @@ function createNav(bot) {
       lastProgressPosition = bot.entity.position.clone();
       lastProgressAt = now;
       missingGoalSince = 0;
+      const smartGoal = activeGoal.goal;
+      if (smartGoal && typeof smartGoal.__smartRefineRange === "function" && smartGoal.__smartRefineRange(now)) {
+        routeState = "pending";
+        routeStateAt = now;
+        lastPathStatus = "smart_approach_refine";
+        lastPathNodeCount = 0;
+        try { bot.pathfinder.setGoal(smartGoal, activeGoal.dynamic); } catch (e) {}
+      }
       return;
     }
 
-    // The library can clear its goal after a failed search. Since nav.follow()
-    // intentionally de-duplicates identical goals, it would otherwise never
-    // submit the target again. Re-arm the original active goal after a grace
-    // period (unless recovery currently owns the pathfinder).
     if (!bot.pathfinder.goal) {
       if (!missingGoalSince) missingGoalSince = now;
       if (now - missingGoalSince > 900) {
         missingGoalSince = now;
         try {
           console.warn("[Pathfinder] Active task lost its pathfinder goal; restoring it.");
+          routeState = "pending";
+          routeStateAt = now;
+          lastPathStatus = "goal_restore";
+          lastPathNodeCount = 0;
           bot.pathfinder.setGoal(activeGoal.goal, activeGoal.dynamic);
         } catch (e) {}
       }
@@ -581,23 +748,56 @@ function createNav(bot) {
     }
     missingGoalSince = 0;
 
-    // Detect lack of actual body displacement whether isMoving() says true or
-    // false. In v5, the !isMoving branch refreshed the timer every tick, so a
-    // route that had stopped without clearing its goal could never time out.
+    // The planner may legitimately spend up to thinkTimeout computing around
+    // complicated terrain. Do not cancel a pending/partial search after only
+    // a few seconds. If it never produces a route, recover after a full grace.
+    if (routeState === "pending" || routeState === "partial" || routeState === "idle") {
+      // A partial route can already be moving the bot while A* continues its
+      // search. Record real displacement, but do not interrupt the search
+      // until its timeout budget plus a grace period has elapsed.
+      if (routeState === "partial" && lastProgressPosition) {
+        const partialMoved = bot.entity.position.distanceTo(lastProgressPosition);
+        if (partialMoved > 0.08) {
+          lastProgressPosition = bot.entity.position.clone();
+          lastProgressAt = now;
+          movementObserved = true;
+        }
+      }
+      const thinkTimeout = Math.max(5000, Number(bot.pathfinder.thinkTimeout) || 5000);
+      const plannerExpired = now - routeStateAt > thinkTimeout + 7000;
+      const partialRouteStalled = routeState !== "partial" || now - lastProgressAt > 7000;
+      if (plannerExpired && partialRouteStalled) {
+        console.warn(`[Pathfinder] Planner remained ${routeState} without a usable completed route for ${now - routeStateAt}ms; beginning recovery.`);
+        routeState = "failed";
+        lastPathStatus = "planner_stalled";
+        escapeBlockedNode();
+      }
+      return;
+    }
+    if (routeState === "failed") return;
+
     const moved = lastProgressPosition
       ? bot.entity.position.distanceTo(lastProgressPosition)
       : Infinity;
     if (moved > 0.08) {
       lastProgressPosition = bot.entity.position.clone();
       lastProgressAt = now;
+      movementObserved = true;
       return;
     }
-    if (now - lastProgressAt > 3200) escapeBlockedNode();
+    // Allow for jump arcs, entity collisions and step-up animations before
+    // declaring the executor stuck. Use actual displacement, not isMoving().
+    const stallLimit = lastPathNodeCount > 0 ? 7000 : 9500;
+    if (now - lastProgressAt > stallLimit) escapeBlockedNode();
   };
+  bot.on("goal_updated", onGoalUpdated);
   bot.on("path_reset", onPathReset);
   bot.on("path_update", onPathUpdate);
   bot.on("physicsTick", onPhysicsTick);
   bot.once("end", () => {
+    if (escapeRetryTimer) clearTimeout(escapeRetryTimer);
+    escapeRetryTimer = null;
+    bot.removeListener("goal_updated", onGoalUpdated);
     bot.removeListener("path_reset", onPathReset);
     bot.removeListener("path_update", onPathUpdate);
     bot.removeListener("physicsTick", onPhysicsTick);
@@ -607,9 +807,22 @@ function createNav(bot) {
     follow(entity, range = 2) {
       if (!entity || !entity.position) return;
       const k = "f:" + entity.id + ":" + range;
-      if (k === key) return;
+      if (k === key) {
+        if (followState && followState.lastPos && entity.position.distanceTo(followState.lastPos) > 1.0) {
+          followState.lastPos = entity.position.clone();
+          if (activeGoal && activeGoal.goal && typeof activeGoal.goal.__smartReset === "function") {
+            activeGoal.goal.__smartReset();
+            routeState = "pending";
+            routeStateAt = Date.now();
+            lastPathStatus = "target_moved_replan";
+            lastPathNodeCount = 0;
+            try { bot.pathfinder.setGoal(activeGoal.goal, true); } catch (e) {}
+          }
+        }
+        return;
+      }
       key = k;
-      followState = { entity, range };
+      followState = { entity, range, lastPos: entity.position.clone() };
       gotoState = null;
       escapeInProgress = false;
       setActiveGoal(followGoal(entity, range), true);
@@ -635,6 +848,11 @@ function createNav(bot) {
       activeGoal = goalState;
       lastProgressPosition = bot.entity && bot.entity.position ? bot.entity.position.clone() : null;
       lastProgressAt = Date.now();
+      movementObserved = false;
+      routeState = "pending";
+      routeStateAt = Date.now();
+      lastPathStatus = "pending";
+      lastPathNodeCount = 0;
 
       return new Promise((resolve, reject) => {
         let settled = false;
@@ -686,6 +904,8 @@ function createNav(bot) {
       });
     },
     stop() {
+      if (escapeRetryTimer) clearTimeout(escapeRetryTimer);
+      escapeRetryTimer = null;
       if (cancelGoalPromise) cancelGoalPromise(new Error("Navigation stopped"));
       key = null;
       followState = null;
@@ -694,9 +914,14 @@ function createNav(bot) {
       escapeInProgress = false;
       recoverySwappingGoal = false;
       lastProgressPosition = null;
+      routeState = "idle";
+      lastPathStatus = "idle";
+      lastPathNodeCount = 0;
       bot.pathfinder.setGoal(null);
     },
     forget() {
+      if (escapeRetryTimer) clearTimeout(escapeRetryTimer);
+      escapeRetryTimer = null;
       key = null;
       followState = null;
       gotoState = null;
@@ -704,6 +929,24 @@ function createNav(bot) {
       escapeInProgress = false;
       recoverySwappingGoal = false;
       lastProgressPosition = null;
+      routeState = "idle";
+      lastPathStatus = "idle";
+      lastPathNodeCount = 0;
+    },
+    status() {
+      return {
+        routeState,
+        lastPathStatus,
+        pathNodes: lastPathNodeCount,
+        routeAgeMs: Math.max(0, Date.now() - routeStateAt),
+        noProgressMs: Math.max(0, Date.now() - lastProgressAt),
+        escapes: escapeCount,
+        escapeInProgress,
+        approachRange: activeGoal && activeGoal.goal && Number.isFinite(activeGoal.goal.__smartRange)
+          ? activeGoal.goal.__smartRange : null,
+        baseApproachRange: activeGoal && activeGoal.goal && Number.isFinite(activeGoal.goal.__smartBaseRange)
+          ? activeGoal.goal.__smartBaseRange : null,
+      };
     },
   };
 }
@@ -762,9 +1005,9 @@ function createMelee(bot, nav) {
     // Always keep a live pathfinder goal while approaching. The older close-
     // range controller called nav.stop() and pushed forward/strafe directly;
     // near a wall, fence, tree or house corner that left no recovery goal at
-    // all. A smaller follow radius also prevents stopping on the wrong side
-    // of a wall merely because the target is within two Euclidean blocks.
-    nav.follow(target, 1.1);
+    // all. The eye-to-torso follow endpoint avoids stopping behind a wall,
+    // while the wider range is tolerant of vertical terrain differences.
+    nav.follow(target, 2.0);
 
     const visible = hasLineOfSight(bot, target);
     const laneClear = hasClearMeleeLane(bot, target, 2.2);
