@@ -13,6 +13,7 @@ const config = require("./settings.json");
 const cmd = require("./commands");
 const { isHostile } = require("./combatUtils");
 const { installPathUpdateInvalidationGuard } = require("./pathfinder-compat");
+const { installMovementPacketGuard } = require("./packet-guard");
 const express = require("express");
 const http = require("http");
 const https = require("https");
@@ -1567,6 +1568,7 @@ function createBot() {
     });
 
     bot.loadPlugin(pathfinder);
+    installMovementPacketGuard(bot, (m) => addLog(m));
     // Backport the upstream path_update invalidation fix: recovery listeners
     // may replace goals during a path_update callback, and old pathfinder
     // builds can otherwise install the stale result after the callback.
