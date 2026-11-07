@@ -420,8 +420,26 @@ function initCommands(bot, mcData, defaultMove, deps) {
     sleepBedKey = bedKey;
     try {
       nav.stop();
+      // A sneaking player holding any item (e.g. an off-hand shield) cannot
+      // activate a bed - the anti-AFK sneak made every attempt fail silently.
+      try {
+        bot.clearControlStates();
+        bot.setControlState("sneak", false);
+        bot.setControlState("sprint", false);
+      } catch (e) {}
       const freshBed = bot.blockAt(bed.position) || bed;
-      await bot.sleep(freshBed);
+      const trySleep = async () => {
+        try { await bot.lookAt(freshBed.position.offset(0.5, 0.5, 0.5), true); } catch (e) {}
+        await sleep(350); // let the server see the un-sneak + new rotation first
+        await bot.sleep(freshBed);
+      };
+      try {
+        await trySleep();
+      } catch (firstError) {
+        log("sleep attempt 1 failed: " + String((firstError && firstError.message) || firstError));
+        await sleep(900);
+        await trySleep(); // one retry before giving up
+      }
       say("Sleeping now. I'll resume my previous task when I wake.");
     } catch (e) {
       ctx.sleepNavigating = false;
@@ -430,11 +448,15 @@ function initCommands(bot, mcData, defaultMove, deps) {
       // server refuses sleep because a hostile mob is nearby or it is not yet
       // valid to sleep. Retry at a calmer 30-second interval.
       sleepRetryAfter = Date.now() + 30000;
+      log("sleep failed: " + String((e && e.message) || e));
       if (now - lastSleepErrorNotice > 30000) {
         lastSleepErrorNotice = now;
         say("I found a bed but couldn't sleep: " + String(e.message || e).slice(0, 120));
       }
       resumeModeAfterSleep();
+      if (ctx.mode === "idle" && !ctx.roam && config.utils["anti-afk"] && config.utils["anti-afk"].enabled && config.utils["anti-afk"].sneak) {
+        try { bot.setControlState("sneak", true); } catch (e) {}
+      }
     } finally {
       sleepAttempt = false;
     }
@@ -448,6 +470,9 @@ function initCommands(bot, mcData, defaultMove, deps) {
     ctx.sleepNavigating = false;
     sleepBedKey = null;
     resumeModeAfterSleep();
+    if (ctx.mode === "idle" && !ctx.roam && config.utils["anti-afk"] && config.utils["anti-afk"].enabled && config.utils["anti-afk"].sneak) {
+      try { bot.setControlState("sneak", true); } catch (e) {}
+    }
   });
 
   async function dropAllInventory() {
