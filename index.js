@@ -1908,7 +1908,17 @@ function createBot() {
     });
 
     bot.on("error", (err) => {
-      const msg = err.message || "";
+      // Many network errors (AggregateError, ECONNREFUSED...) have an empty
+      // .message; show the code and nested errors so the cause is visible.
+      const parts = [];
+      if (err.message) parts.push(err.message);
+      if (err.code) parts.push(`code=${err.code}`);
+      if (err.syscall) parts.push(`syscall=${err.syscall}`);
+      if (err.address) parts.push(`address=${err.address}${err.port ? ":" + err.port : ""}`);
+      if (Array.isArray(err.errors)) {
+        for (const sub of err.errors) parts.push(`[${sub.code || sub.name}${sub.address ? " " + sub.address + ":" + sub.port : ""}]`);
+      }
+      const msg = parts.join(" ") || String(err.name || err);
       addLog(`[Bot] Error: ${msg}`);
       botState.errors.push({ type: "error", message: msg, time: Date.now() });
       // Don't reconnect on error - let 'end' event handle it
