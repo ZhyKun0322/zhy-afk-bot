@@ -23,6 +23,16 @@ function installMovementPacketGuard(bot, log = console.warn) {
   let repairs = 0;
   let lastLog = 0;
 
+  let tickEndBroken = false;
+  const tickEndSupported = () => {
+    if (tickEndBroken) return false;
+    try {
+      const reg = bot.registry;
+      if (reg && reg.version && typeof reg.version['>='] === 'function') return reg.version['>=']('1.21.2');
+    } catch (_) {}
+    return false;
+  };
+
   const bad = (v) => typeof v !== 'number' || !Number.isFinite(v);
 
   client.write = function guardedWrite(name, params) {
@@ -63,7 +73,16 @@ function installMovementPacketGuard(bot, log = console.warn) {
         for (const f of ROT_FIELDS) if (f in params) good[f] = params[f];
       }
     }
-    return originalWrite(name, params);
+    const result = originalWrite(name, params);
+    // Newer servers (1.21.2+ protocol; strictly enforced by 26.x servers, also
+    // behind ViaVersion) allow one movement packet per tick and reset that
+    // counter only when the client sends tick_end. Mineflayer never sends it, so
+    // the 2nd movement packet gets the bot kicked with invalid_player_movement
+    // about 1.5s after joining. Send it right after every movement packet.
+    if (MOVE_PACKETS.has(name) && tickEndSupported()) {
+      try { originalWrite('tick_end', {}); } catch (_) { tickEndBroken = true; }
+    }
+    return result;
   };
   client.__movementGuard = true;
   return () => { client.write = originalWrite; delete client.__movementGuard; };

@@ -2,17 +2,19 @@
 const assert = require('node:assert/strict');
 const { installMovementPacketGuard } = require('../packet-guard');
 const sent = [];
-const bot = { entity: { position: { x: NaN, y: 64, z: 0 }, velocity: { x: NaN, y: 0, z: 0 }, yaw: NaN, pitch: 0 }, _client: { write: (n, p) => sent.push([n, { ...p }]) } };
+const bot = { entity: { position: { x: NaN, y: 64, z: 0 }, velocity: { x: NaN, y: 0, z: 0 }, yaw: NaN, pitch: 0 }, registry: { version: { '>=': (v) => v === '1.21.2' } }, _client: { write: (n, p) => sent.push([n, { ...p }]) } };
 installMovementPacketGuard(bot, () => {});
 // bad packet before any good one is dropped
 bot._client.write('position', { x: NaN, y: 64, z: 0, onGround: true });
 assert.equal(sent.length, 0);
+assert.equal(sent.filter(([n]) => n === 'tick_end').length, 0);
 bot._client.write('position_look', { x: 10, y: 64, z: 5, yaw: 1, pitch: 0.5, onGround: true });
 bot._client.write('position_look', { x: NaN, y: 64, z: Infinity, yaw: NaN, pitch: 0.5, onGround: true });
-assert.equal(sent.length, 2);
-const fixed = sent[1][1];
+assert.deepEqual(sent.map(([n]) => n), ['position_look', 'tick_end', 'position_look', 'tick_end']);
+const fixed = sent[2][1];
 assert.deepEqual([fixed.x, fixed.z, fixed.yaw], [10, 5, 1]);
 assert.ok(Number.isFinite(bot.entity.position.x) && Number.isFinite(bot.entity.yaw) && bot.entity.velocity.x === 0);
 bot._client.write('chat', { message: 'hi' });
-assert.equal(sent.length, 3);
+assert.equal(sent.length, 5);
+assert.equal(sent[4][0], 'chat');
 console.log('Movement packet guard tests passed.');
