@@ -1779,6 +1779,25 @@ function createBot() {
       configureDoorAwareMovements(bot, woodMove);
       installPathfinderCollisionFixes(bot, defaultMove);
       installPathfinderCollisionFixes(bot, woodMove);
+      // Rescue profile: used by alternate-route recovery when the normal route
+      // fails. Parkour + sprint-jumps, longer drops, cheap terrain clearing and
+      // scaffolding, while buildings/ores/containers stay protected.
+      const rescueMove = new Movements(bot, mcData);
+      rescueMove.allowFreeMotion = false;
+      rescueMove.canDig = true;
+      rescueMove.digCost = 2.0;
+      rescueMove.liquidCost = 2;
+      rescueMove.maxDropDown = 6;
+      rescueMove.infiniteLiquidDropdownDistance = true;
+      rescueMove.allow1by1towers = true;
+      rescueMove.allowParkour = true;
+      rescueMove.allowSprinting = true;
+      rescueMove.allowEntityDetection = true;
+      if (woodMove.blocksCantBreak) rescueMove.blocksCantBreak = new Set(woodMove.blocksCantBreak);
+      if (Array.isArray(woodMove.scafoldingBlocks)) rescueMove.scafoldingBlocks = [...woodMove.scafoldingBlocks];
+      if (typeof woodMove.safeToBreak === "function") rescueMove.safeToBreak = woodMove.safeToBreak;
+      configureDoorAwareMovements(bot, rescueMove);
+      installPathfinderCollisionFixes(bot, rescueMove);
       addLog("[Pathfinder] Hybrid A* movement enabled: parkour, sprint-jumps, water routes, safe scaffolding, and high-cost soft-terrain clearing; structures and valuable blocks remain protected.");
       let lastPathDiagnosticAt = 0;
       bot.on("path_reset", (reason) => {
@@ -1801,7 +1820,7 @@ function createBot() {
 
       // chat commands: !wood !follow !kill !guard !pvp ...
       if (!config.commands || config.commands.enabled !== false) {
-        cmd.initCommands(bot, mcData, defaultMove, { addInterval, addLog, config, woodMove });
+        cmd.initCommands(bot, mcData, defaultMove, { addInterval, addLog, config, woodMove, rescueMove });
       }
 
       // Attempt creative mode (only works if bot has OP and enabled in settings)
@@ -2087,7 +2106,7 @@ function initializeModules(bot, mcData, defaultMove) {
           if (
             !bot ||
             !botState.connected ||
-            !cmd.isIdle() ||
+            !cmd.isRoaming() ||
             typeof bot.setControlState !== "function"
           )
             return;
@@ -2174,6 +2193,7 @@ function startCircleWalk(bot, defaultMove) {
   const radius = config.movement["circle-walk"].radius;
   let angle = 0;
   let lastPathTime = 0;
+  let lastPos = null;
 
   addInterval(() => {
     if (!bot || !botState.connected || cmd.isStationary()) return;
@@ -2181,6 +2201,19 @@ function startCircleWalk(bot, defaultMove) {
     if (now - lastPathTime < 2000) return;
     lastPathTime = now;
     try {
+      // Roam stuck-breaker: if the last roam step barely moved us, the bot is
+      // wedged on a corner/ledge. Pick a very different heading and shake loose.
+      const here = bot.entity.position;
+      if (lastPos && here.distanceTo(lastPos) < 0.6 && bot.pathfinder.isMoving()) {
+        angle += Math.PI * 0.75 + Math.random();
+        const side = Math.random() < 0.5 ? "left" : "right";
+        bot.setControlState(side, true);
+        bot.setControlState("jump", true);
+        setTimeout(() => {
+          try { bot.setControlState(side, false); bot.setControlState("jump", false); } catch (e) {}
+        }, 450);
+      }
+      lastPos = here.clone();
       const x = bot.entity.position.x + Math.cos(angle) * radius;
       const z = bot.entity.position.z + Math.sin(angle) * radius;
       bot.pathfinder.setMovements(defaultMove);
@@ -2204,7 +2237,7 @@ function startRandomJump(bot) {
     if (
       !bot ||
       !botState.connected ||
-      !cmd.isIdle() ||
+      !cmd.isRoaming() ||
       typeof bot.setControlState !== "function"
     )
       return;
@@ -2223,7 +2256,7 @@ function startRandomJump(bot) {
 
 function startLookAround(bot) {
   addInterval(() => {
-    if (!bot || !botState.connected || !cmd.isIdle()) return;
+    if (!bot || !botState.connected || !cmd.isRoaming()) return;
     try {
       const yaw = Math.random() * Math.PI * 2 - Math.PI;
       const pitch = (Math.random() * Math.PI) / 2 - Math.PI / 4;

@@ -118,6 +118,65 @@ try {
   assert.equal(nav.status().lastPathStatus, 'goal_updated');
   nav.stop(); // also clears the scheduled recovery retry
 
+
+  // Alternate route: target is behind a wall, so the direct goal fails. The
+  // controller must try standing tiles around the TARGET, then escalate to the
+  // rescue profile and report once when a whole round fails.
+  const solid = { name: 'stone', boundingBox: 'block', shapes: [[0, 0, 0, 1, 1, 1]] };
+  const air = { name: 'air', boundingBox: 'empty', shapes: [] };
+  bot.blockAt = (pos) => (Math.floor(pos.y) <= 63 ? solid : air);
+  bot.pathfinder.movements = { countScaffoldingItems: () => 0 };
+  const rescue = { rescue: true };
+  const setMovementsCalls = [];
+  bot.pathfinder.movements = { countScaffoldingItems: () => 0 };
+  bot.pathfinder.setMovements = (m) => { setMovementsCalls.push(m); bot.pathfinder.movements = m; };
+  const goalLog = [];
+  const origSetGoal = bot.pathfinder.setGoal.bind(bot.pathfinder);
+  bot.pathfinder.setGoal = (g, d) => { goalLog.push(g); origSetGoal(g, d); };
+  let notices = 0;
+  nav.setRescueMovements(rescue);
+  nav.onUnreachable(() => { notices++; });
+  bot.entity.position = new Vec3(0.5, 64, 0.5);
+  const walled = { id: 9, height: 1.8, position: new Vec3(12.5, 64, 0.5) };
+  fakeNow += 20000;
+  nav.follow(walled, 2.25);
+  // exhaust the smart-range widening, then recovery kicks in
+  for (let i = 0; i < 8; i++) bot.emit('path_update', { status: 'noPath', path: [] });
+  const wp = goalLog.filter((g) => g instanceof GoalBlock);
+  assert.ok(wp.length > 0, 'alternate-route waypoint goals must be tried');
+  assert.ok(wp.some((g) => Math.hypot(g.x - 12, g.z - 0) <= 8.5), 'a waypoint must be near the target');
+  // every waypoint fails -> round ends, rescue profile is used for round two
+  for (let i = 0; i < 60; i++) {
+    fakeNow += 6000;
+    bot.emit('path_update', { status: 'noPath', path: [] });
+    bot.emit('physicsTick');
+  }
+  assert.ok(nav.status().recoveryFailures >= 1 || notices >= 1, 'failed rounds must be counted');
+  assert.ok(setMovementsCalls.includes(rescue), 'rescue movement profile must be used after a failed round');
+  nav.stop();
+
+
+  // Unstick nudges: a bot that is "moving" but makes no displacement gets
+  // jump / strafe / back-off inputs well before the 7s stall recovery.
+  const ctl = [];
+  bot.setControlState = (k, v) => ctl.push([k, v]);
+  bot.pathfinder.isMoving = () => true;
+  bot.pathfinder.movements = { countScaffoldingItems: () => 0 };
+  bot.entity.position = new Vec3(0.5, 64, 0.5);
+  fakeNow += 30000;
+  const stuckTarget = { id: 21, height: 1.8, position: new Vec3(6.5, 64, 0.5) };
+  nav.follow(stuckTarget, 2.25);
+  bot.pathfinder.path = [{}, {}];
+  bot.emit('path_update', { status: 'success', path: bot.pathfinder.path });
+  fakeNow += 1500; bot.emit('physicsTick');
+  fakeNow += 1100; bot.emit('physicsTick');
+  fakeNow += 1100; bot.emit('physicsTick');
+  fakeNow += 1100; bot.emit('physicsTick');
+  const pressed = new Set(ctl.filter(([, v]) => v).map(([k]) => k));
+  assert.ok(pressed.has('jump') && pressed.has('right') && pressed.has('left') && pressed.has('back'),
+    'unstick must cycle jump, strafe right/left and back: ' + [...pressed]);
+  nav.stop();
+
   console.log('Pathfinding navigation regression tests passed.');
 } finally {
   Date.now = realNow;

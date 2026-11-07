@@ -8,7 +8,7 @@
   "server": {
     "ip": "tempestcraft.mcsh.gg",
     "port": 25565,
-    "version": "1.20.1",
+    "version": "",
     "try-creative": false
   },
   "position": {
@@ -31,7 +31,9 @@
       "repeat": true,
       "repeat-delay": 120,
       "messages": [
-        "I'm a regular player"
+        "I'm a regular player",
+        "Subscribe to SoloPlayz!",
+        "Want Cheap Premium MC Server? https://discord.gg/VRMUnDkf95"
       ]
     },
     "chat-log": true,

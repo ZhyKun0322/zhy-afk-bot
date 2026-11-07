@@ -18,6 +18,7 @@ Type these in Minecraft chat. Bedrock (Geyser) players work too - the "." in fro
 | `!armor` | Toggles automatic best-armor and shield equipment. Type again to unequip armor and the off-hand shield. |
 | `!inventory` | Drops all stored items, equipped armor, and the off-hand item. |
 | `!pathstatus` | Shows current mode, active path goal, remaining path nodes, moving/mining/building state and coordinates. |
+| `!roam` | Toggles anti-AFK wandering. The bot stands completely still until you type this; it also stops on `!stop` or any other command. |
 | `!stop` | Stops whatever it is doing. |
 | `!help` | Lists commands in chat. |
 
@@ -52,3 +53,8 @@ Type these in Minecraft chat. Bedrock (Geyser) players work too - the "." in fro
 - A **placed bed** must be loaded within 48 blocks. A bed item in inventory is not enough; place it first.
 - When night arrives during `!follow`, `!kill`, `!wood`, `!guard`, or `!pvp`, auto-sleep pauses that task, sleeps, then resumes it after the wake event. Eating, drop pickup, and open inventory windows are allowed to finish first. If the server refuses sleep, the task resumes and auto-sleep backs off for 30 seconds before trying again.
 - Use `!sleepstatus` to see the exact reason it is not sleeping (daytime, no bed found, sleeping, or walking to a bed).
+
+## Alternate routes, parkour and unstick (v14)
+- If the direct route to a goal fails, the bot tries standing tiles around the target (different sides/heights), then retries with a rescue profile (parkour, sprint-jumps, 6-block drops, cheap terrain clearing, scaffolding; buildings/ores/containers stay protected).
+- If it makes no progress for ~1.3s while walking, it shakes loose with a jump, strafe left/right, or a back-off, before the full stall recovery runs.
+- Diagonal moves require both side corridors clear (hitbox-safe).

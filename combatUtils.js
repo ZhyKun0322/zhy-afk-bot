@@ -288,6 +288,12 @@ function createNav(bot) {
   let routeStateAt = Date.now();
   let lastPathStatus = "idle";
   let lastPathNodeCount = 0;
+  // Alternate-route fallback state. When the direct route to a goal fails, the
+  // controller tries reachable standing tiles on the target's side, then (after
+  // a whole round of failures) re-plans with a more permissive rescue profile.
+  let rescueMovements = null;
+  let unreachableCallback = null;
+  let lastUnreachableNoticeAt = 0;
 
   // Dynamic, staged approach goal. It first seeks a close, visible position;
   // if terrain makes that impossible it expands the acceptable distance in
@@ -476,6 +482,65 @@ function createNav(bot) {
     return candidates.slice(0, 20);
   }
 
+  const HAZARD_BLOCKS = new Set(["lava", "flowing_lava", "fire", "soul_fire", "cactus", "magma_block", "sweet_berry_bush", "wither_rose", "powder_snow"]);
+
+  // Can the bot stand with its feet in this block? Returns null when not.
+  function evaluateStandable(feetPos, allowTower) {
+    const bodyBlocks = Math.max(2, Math.ceil(bot.entity.height || 1.8));
+    const feet = bot.blockAt(feetPos, false);
+    if (!isClearBodyBlock(feet) || HAZARD_BLOCKS.has(feet.name)) return null;
+    for (let h = 1; h < bodyBlocks; h++) {
+      if (!isClearBodyBlock(bot.blockAt(feetPos.offset(0, h, 0), false))) return null;
+    }
+    const floor = bot.blockAt(feetPos.offset(0, -1, 0), false);
+    if (floor && HAZARD_BLOCKS.has(floor.name)) return null;
+    const supported = hasSafeFloor(floor);
+    if (!supported && !allowTower) return null;
+    return { supported, towerable: !supported };
+  }
+
+  // Alternate route planner: standing tiles around the *target* (not around the
+  // bot) ranked by closeness to the target. If the exact approach tile is
+  // unreachable (wall, fence, water moat, cliff) the pathfinder is asked to get
+  // to one of these tiles instead - different sides and heights - and the
+  // original goal is re-planned from there.
+  function findTargetSideWaypoints(goal, failed) {
+    const target = targetPosition(goal);
+    if (!target || !bot.entity) return [];
+    const t = new Vec3(Math.floor(target.x), Math.floor(target.y), Math.floor(target.z));
+    const me = bot.entity.position;
+    const canTower = hasTowerBlocks();
+    const R = 8;
+    const found = [];
+    for (let dx = -R; dx <= R; dx++) {
+      for (let dz = -R; dz <= R; dz++) {
+        const horizontal = Math.hypot(dx, dz);
+        if (horizontal > R + 0.5 || horizontal < 1) continue;
+        for (let dy = -3; dy <= 3; dy++) {
+          const feetPos = t.offset(dx, dy, dz);
+          const info = evaluateStandable(feetPos, canTower && dy > 0);
+          if (!info) continue;
+          const key = feetPos.x + "," + feetPos.y + "," + feetPos.z;
+          const failCount = (failed && failed.get(key)) || 0;
+          const score = horizontal + Math.abs(dy) * 0.6 +
+            Math.hypot(feetPos.x + 0.5 - me.x, feetPos.z + 0.5 - me.z) * 0.1 +
+            failCount * 8 + (info.supported ? 0 : 3);
+          found.push({ pos: feetPos, score, supported: info.supported, towerable: info.towerable, kind: "target-side", key });
+        }
+      }
+    }
+    found.sort((a, b) => a.score - b.score);
+    // Spread the picks: skip tiles that sit next to an already chosen one at
+    // the same height so each attempt approaches from a genuinely new angle.
+    const picked = [];
+    for (const c of found) {
+      if (picked.some((p) => p.pos.y === c.pos.y && Math.hypot(p.pos.x - c.pos.x, p.pos.z - c.pos.z) < 2.5)) continue;
+      picked.push(c);
+      if (picked.length >= 10) break;
+    }
+    return picked;
+  }
+
   function scheduleEscapeRetry(delay) {
     if (escapeRetryTimer || escapeInProgress) return;
     escapeRetryTimer = setTimeout(() => {
@@ -502,7 +567,20 @@ function createNav(bot) {
     }
 
     const goalSnapshot = activeGoal;
-    const candidates = findSafeEscapeTiles(goalSnapshot.goal);
+    const failedWaypoints = goalSnapshot.failedWaypoints || (goalSnapshot.failedWaypoints = new Map());
+    const localTiles = findSafeEscapeTiles(goalSnapshot.goal).map((c) => ({
+      ...c, kind: "local", key: c.pos.x + "," + c.pos.y + "," + c.pos.z,
+    }));
+    const targetTiles = findTargetSideWaypoints(goalSnapshot.goal, failedWaypoints);
+    // Interleave "get out of here" tiles with "get around to the target" tiles
+    // so a trapped bot and a walled-off target are both handled quickly.
+    const candidates = [];
+    const seen = new Set();
+    for (let i = 0; i < Math.max(localTiles.length, targetTiles.length); i++) {
+      for (const c of [targetTiles[i], localTiles[i]]) {
+        if (c && !seen.has(c.key)) { seen.add(c.key); candidates.push(c); }
+      }
+    }
     if (!candidates.length) {
       lastEscapeAt = now;
       // Critical: do not leave routeState="failed" here. That state suppresses
@@ -533,9 +611,22 @@ function createNav(bot) {
       return;
     }
 
+    // After one whole round of failed waypoints, escalate to the rescue
+    // movement profile (wider terrain clearing) for the next round.
+    let previousMovements = null;
+    if (rescueMovements && (goalSnapshot.recoveryFailures || 0) >= 1 && bot.pathfinder.movements !== rescueMovements) {
+      try {
+        previousMovements = bot.pathfinder.movements;
+        bot.pathfinder.setMovements(rescueMovements);
+        console.warn("[Pathfinder] Alternate-route recovery is using the rescue movement profile.");
+      } catch (e) { previousMovements = null; }
+    }
+
     let candidateIndex = 0;
     let attemptTimer = null;
     let activeEscapeGoal = null;
+    let activeCandidate = null;
+    let reachedWaypoint = false;
     let listeners = null;
     const finishRecovery = (restoreOriginal) => {
       if (attemptTimer) clearTimeout(attemptTimer);
@@ -545,6 +636,21 @@ function createNav(bot) {
       }
       listeners = null;
       activeEscapeGoal = null;
+      activeCandidate = null;
+      if (previousMovements) {
+        try { bot.pathfinder.setMovements(previousMovements); } catch (e) {}
+        previousMovements = null;
+      }
+      if (reachedWaypoint) {
+        goalSnapshot.recoveryFailures = 0;
+      } else {
+        goalSnapshot.recoveryFailures = (goalSnapshot.recoveryFailures || 0) + 1;
+        if (goalSnapshot.recoveryFailures >= 2 && typeof unreachableCallback === "function" &&
+            Date.now() - lastUnreachableNoticeAt > 60000) {
+          lastUnreachableNoticeAt = Date.now();
+          try { unreachableCallback({ failures: goalSnapshot.recoveryFailures }); } catch (e) {}
+        }
+      }
       if (restoreOriginal && activeGoal === goalSnapshot && bot.entity) {
         try {
           lastProgressPosition = bot.entity.position.clone();
@@ -575,13 +681,22 @@ function createNav(bot) {
         return;
       }
 
+      // The waypoint we are leaving did not get us anywhere: remember that so
+      // the next recovery round ranks it last instead of retrying it first.
+      if (activeCandidate && !reachedWaypoint) {
+        failedWaypoints.set(activeCandidate.key, (failedWaypoints.get(activeCandidate.key) || 0) + 1);
+      }
       const candidate = candidates[candidateIndex++];
+      activeCandidate = candidate;
       const tile = candidate.pos;
       activeEscapeGoal = new goals.GoalBlock(tile.x, tile.y, tile.z);
-      console.warn(`[Pathfinder] Trying 3D escape waypoint ${tile.x},${tile.y},${tile.z} (${candidate.supported ? "supported" : "tower candidate"}).`);
+      console.warn(`[Pathfinder] Trying ${candidate.kind === "target-side" ? "alternate route via tile near target" : "3D escape waypoint"} ${tile.x},${tile.y},${tile.z} (${candidate.supported ? "supported" : "tower candidate"}).`);
       listeners = {
         onReached: (reachedGoal) => {
-          if (reachedGoal === activeEscapeGoal) finishRecovery(true);
+          if (reachedGoal === activeEscapeGoal) {
+            reachedWaypoint = true;
+            finishRecovery(true);
+          }
         },
         onPathUpdate: (result) => {
           if (!result) return;
@@ -696,6 +811,40 @@ function createNav(bot) {
     }
   };
 
+  // Unstick nudges. A 0.6-block-wide hitbox can wedge against a block corner
+  // or keep bumping a ledge it cannot clear (jump lands on the edge, slides
+  // back, repeat). Long before the full stall recovery, shake the bot loose:
+  // jump, strafe either way, or back off for a run-up. Pathfinder only drives
+  // forward/jump/sprint, so strafe/back inputs are not overwritten.
+  let nudgeStep = 0;
+  let lastNudgeAt = 0;
+  const releaseNudge = (...states) => setTimeout(() => {
+    try { for (const st of states) bot.setControlState(st, false); } catch (e) {}
+  }, 420);
+  function maybeNudge(now) {
+    if (now - lastProgressAt < 1300 || now - lastNudgeAt < 1000) return;
+    let moving = false;
+    try { moving = !!(bot.pathfinder.isMoving && bot.pathfinder.isMoving()); } catch (e) {}
+    if (!moving || typeof bot.setControlState !== "function") return;
+    lastNudgeAt = now;
+    const step = nudgeStep++ % 4;
+    try {
+      if (step === 0) {
+        bot.setControlState("jump", true);
+        releaseNudge("jump");
+      } else if (step === 1 || step === 2) {
+        const side = step === 1 ? "right" : "left";
+        bot.setControlState(side, true);
+        bot.setControlState("jump", true);
+        releaseNudge(side, "jump");
+      } else {
+        bot.setControlState("back", true);
+        releaseNudge("back");
+      }
+      console.warn(`[Pathfinder] No progress for ${((now - lastProgressAt) / 1000).toFixed(1)}s - unstick nudge #${step + 1}.`);
+    } catch (e) {}
+  }
+
   const onPhysicsTick = () => {
     if (!bot.entity || !activeGoal || escapeInProgress) return;
     const now = Date.now();
@@ -786,6 +935,7 @@ function createNav(bot) {
           movementObserved = true;
         }
       }
+      if (routeState === "partial") maybeNudge(now);
       const thinkTimeout = Math.max(5000, Number(bot.pathfinder.thinkTimeout) || 5000);
       const plannerExpired = now - routeStateAt > thinkTimeout + 7000;
       const partialRouteStalled = routeState !== "partial" || now - lastProgressAt > 7000;
@@ -810,6 +960,7 @@ function createNav(bot) {
     }
     // Allow for jump arcs, entity collisions and step-up animations before
     // declaring the executor stuck. Use actual displacement, not isMoving().
+    maybeNudge(now);
     const stallLimit = lastPathNodeCount > 0 ? 7000 : 9500;
     if (now - lastProgressAt > stallLimit) escapeBlockedNode();
   };
@@ -835,6 +986,8 @@ function createNav(bot) {
           followState.lastPos = entity.position.clone();
           if (activeGoal && activeGoal.goal && typeof activeGoal.goal.__smartReset === "function") {
             activeGoal.goal.__smartReset();
+            activeGoal.failedWaypoints = null;
+            activeGoal.recoveryFailures = 0;
             routeState = "pending";
             routeStateAt = Date.now();
             lastPathStatus = "target_moved_replan";
@@ -956,8 +1109,18 @@ function createNav(bot) {
       lastPathStatus = "idle";
       lastPathNodeCount = 0;
     },
+    // Movement profile used for the second and later rounds of alternate-route
+    // recovery (usually the permissive woodcutting profile).
+    setRescueMovements(movements) {
+      rescueMovements = movements || null;
+    },
+    // Called (rate-limited) when repeated alternate-route rounds all fail.
+    onUnreachable(callback) {
+      unreachableCallback = typeof callback === "function" ? callback : null;
+    },
     status() {
       return {
+        recoveryFailures: activeGoal ? (activeGoal.recoveryFailures || 0) : 0,
         routeState,
         lastPathStatus,
         pathNodes: lastPathNodeCount,

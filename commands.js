@@ -18,6 +18,7 @@ const ctx = {
   autoSleep: false, // !sleep toggles automatic night-time bed use
   sleepNavigating: false,
   autoArmor: false, // !armor toggles armor + shield equipment
+  roam: false, // !roam toggles anti-AFK wandering (off by default: the bot stands still)
   token: 0, // bumps on every mode change - cancels old async loops
 };
 
@@ -66,7 +67,11 @@ function hasHome() {
 }
 // true when the bot should stand still instead of wandering (anti-AFK circle walk etc.)
 function isStationary() {
-  return ctx.mode !== "idle" || ctx.home !== null || ctx.sleepNavigating;
+  return ctx.mode !== "idle" || ctx.home !== null || ctx.sleepNavigating || !ctx.roam;
+}
+// true only while the player has asked the bot to roam (!roam) and nothing else is running
+function isRoaming() {
+  return ctx.roam && !isStationary();
 }
 
 function loadHome(config) {
@@ -104,7 +109,7 @@ function parseChatLine(line) {
 }
 
 function initCommands(bot, mcData, defaultMove, deps) {
-  const { addInterval, addLog, config, woodMove = defaultMove } = deps;
+  const { addInterval, addLog, config, woodMove = defaultMove, rescueMove = null } = deps;
   const cfg = buildConfig(config.commands);
   if (!cfg.enabled) return;
 
@@ -120,6 +125,13 @@ function initCommands(bot, mcData, defaultMove, deps) {
 
   bot.pathfinder.setMovements(defaultMove);
   const nav = U.createNav(bot);
+  // Alternate-route recovery: after a full round of failed waypoints the nav
+  // controller re-plans with the permissive profile and tells the player once.
+  nav.setRescueMovements(rescueMove || (woodMove !== defaultMove ? woodMove : null));
+  nav.onUnreachable(() => {
+    if (ctx.mode === "idle") return;
+    say("I can't find a path to you yet - trying other routes.");
+  });
   const melee = U.createMelee(bot, nav);
 
   // ---------- chat output (throttled so we don't get kicked for spam) ----------
@@ -521,6 +533,7 @@ function initCommands(bot, mcData, defaultMove, deps) {
   function stopMode(silent) {
     ctx.token++; // cancels async loops (wood, pickup)
     ctx.mode = "idle";
+    ctx.roam = false;
     ctx.sleepNavigating = false;
     sleepBedKey = null;
     ctx.owner = null;
@@ -952,7 +965,24 @@ function initCommands(bot, mcData, defaultMove, deps) {
   function run(name, args, username) {
     switch (name) {
       case "help":
-        say("!wood [n] !follow !kill !killstatus !guard !unguard !pvp [name] !sleep !sleepstatus !armor !inventory !pathstatus !radius !unsave !stop");
+        say("!wood [n] !follow !kill !killstatus !guard !unguard !pvp [name] !sleep !sleepstatus !armor !inventory !pathstatus !radius !unsave !roam !stop");
+        return;
+
+      case "roam":
+        if (ctx.roam) {
+          stopMode(true);
+          say("Roaming off. Standing still.");
+          return;
+        }
+        if (ctx.home) {
+          say("A fixed position is saved - use !unsave first, then !roam.");
+          return;
+        }
+        stopMode(true);
+        sleepResumeState = null;
+        ctx.roam = true;
+        try { bot.setControlState("sneak", false); } catch (e) {}
+        say("Roaming on - I'll walk around to stay active. Type !roam or !stop to stop.");
         return;
 
       case "stop":
@@ -1198,4 +1228,4 @@ function initCommands(bot, mcData, defaultMove, deps) {
   log("Commands ready (" + cfg.prefix + "help)." + (ctx.home ? " Fixed position: " + ctx.home.x + " " + ctx.home.y + " " + ctx.home.z : ""));
 }
 
-module.exports = { initCommands, isIdle, hasHome, isStationary, ctx, parseChatLine };
+module.exports = { initCommands, isIdle, hasHome, isStationary, isRoaming, ctx, parseChatLine };
