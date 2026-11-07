@@ -746,6 +746,7 @@ function createNav(bot) {
     const now = Date.now();
     if (["stuck", "dig_error", "place_error", "no_scaffolding_blocks"].includes(reason)) {
       if (!escapeInProgress) {
+        if (reason === "stuck" && tryStepUp("path stuck")) return;
         routeState = "failed";
         routeStateAt = now;
         lastPathStatus = reason;
@@ -811,6 +812,139 @@ function createNav(bot) {
     }
   };
 
+  // Real progress is horizontal movement (or a net climb / big drop). Pure
+  // up-and-down bobbing - jumping at a wall and falling back - is NOT progress;
+  // counting it hid the stall from every watchdog.
+  function madeProgress() {
+    const p = bot.entity.position;
+    const a = lastProgressPosition;
+    if (!a) return true;
+    const h = Math.hypot(p.x - a.x, p.z - a.z);
+    const dy = p.y - a.y;
+    return h > 0.08 || dy > 0.9 || dy < -1.5;
+  }
+
+  // Step-up assist ("just jump"): when blocked by a one-block ledge, face it and
+  // hold forward + jump ourselves until the bot is standing on top. The path
+  // executor is paused meanwhile so it cannot cancel the jump half-way, and the
+  // original goal is restored afterwards.
+  let stepAssist = null;
+  let lastStepAssistAt = 0;
+  let stepAssistFails = 0;
+  let stepAssistPauseUntil = 0;
+
+  function topOf(block) {
+    if (!block || !Array.isArray(block.shapes) || !block.shapes.length) return null;
+    let top = 0;
+    for (const sh of block.shapes) top = Math.max(top, sh[4]);
+    return block.position.y + top;
+  }
+
+  function findStepUp() {
+    if (!bot.entity || !activeGoal) return null;
+    const pos = bot.entity.position;
+    const base = Math.floor(pos.y + 0.0625 + 1e-6);
+    const target = targetPosition(activeGoal.goal);
+    let hx = target ? target.x - pos.x : -Math.sin(bot.entity.yaw || 0);
+    let hz = target ? target.z - pos.z : -Math.cos(bot.entity.yaw || 0);
+    const hl = Math.hypot(hx, hz) || 1;
+    hx /= hl; hz /= hl;
+    // Our own headroom must allow a jump.
+    const ownX = Math.floor(pos.x), ownZ = Math.floor(pos.z);
+    for (let h = 1; h <= 2; h++) {
+      if (!isClearBodyBlock(bot.blockAt(new Vec3(ownX, base + h, ownZ), false))) return null;
+    }
+    const dirs = [];
+    for (let k = 0; k < 8; k++) {
+      const a = (k * Math.PI) / 4;
+      const dx = Math.round(Math.cos(a) * 1000) / 1000, dz = Math.round(Math.sin(a) * 1000) / 1000;
+      const norm = Math.hypot(dx, dz);
+      const ux = dx / norm, uz = dz / norm;
+      const dot = ux * hx + uz * hz;
+      if (dot < 0.2) continue; // never climb away from the goal
+      dirs.push({ ux, uz, dot });
+    }
+    dirs.sort((a, b) => b.dot - a.dot);
+    for (const d of dirs) {
+      const fx = Math.floor(pos.x + d.ux * 0.75);
+      const fz = Math.floor(pos.z + d.uz * 0.75);
+      if (fx === ownX && fz === ownZ) continue;
+      const ledge = bot.blockAt(new Vec3(fx, base, fz), false);
+      const top = topOf(ledge);
+      if (top === null || ledge.boundingBox !== "block") continue;
+      const rise = top - pos.y;
+      if (rise < 0.4 || rise > 1.26) continue;
+      let clear = true;
+      for (let h = 1; h <= 2; h++) {
+        if (!isClearBodyBlock(bot.blockAt(new Vec3(fx, base + h, fz), false))) { clear = false; break; }
+      }
+      if (!clear) continue;
+      return { yaw: Math.atan2(-d.ux, -d.uz), ledgeTop: top, fx, fz };
+    }
+    return null;
+  }
+
+  function tryStepUp(reason) {
+    const now = Date.now();
+    if (stepAssist || !activeGoal || escapeInProgress || now < stepAssistPauseUntil || now - lastStepAssistAt < 1200) return false;
+    let info = null;
+    try { info = findStepUp(); } catch (e) { info = null; }
+    if (!info) return false;
+    lastStepAssistAt = now;
+    const snapshot = activeGoal;
+    escapeInProgress = true;
+    recoverySwappingGoal = true;
+    try {
+      bot.pathfinder.setGoal(null);
+      bot.clearControlStates();
+      bot.setControlState("sneak", false);
+      bot.look(info.yaw, 0, true);
+      bot.setControlState("forward", true);
+      bot.setControlState("sprint", false);
+    } catch (e) {
+      escapeInProgress = false;
+      recoverySwappingGoal = false;
+      return false;
+    }
+    console.warn(`[Pathfinder] Step-up assist (${reason}): jumping onto ledge at ${info.fx},${Math.floor(info.ledgeTop) - 1},${info.fz}.`);
+    let ticks = 0;
+    let settle = -1;
+    const finish = (ok) => {
+      bot.removeListener("physicsTick", onTick);
+      try { bot.setControlState("jump", false); bot.setControlState("forward", false); } catch (e) {}
+      stepAssist = null;
+      stepAssistFails = ok ? 0 : stepAssistFails + 1;
+      if (stepAssistFails >= 3) { stepAssistPauseUntil = Date.now() + 10000; stepAssistFails = 0; }
+      if (activeGoal === snapshot && bot.entity) {
+        try {
+          lastProgressPosition = bot.entity.position.clone();
+          lastProgressAt = Date.now();
+          movementObserved = false;
+          routeState = "pending";
+          routeStateAt = Date.now();
+          lastPathStatus = "step_assist_replan";
+          lastPathNodeCount = 0;
+          bot.pathfinder.setGoal(snapshot.goal, snapshot.dynamic);
+        } catch (e) { key = null; }
+      }
+      recoverySwappingGoal = false;
+      escapeInProgress = false;
+    };
+    const onTick = () => {
+      if (!bot.entity || activeGoal !== snapshot) { finish(false); return; }
+      ticks++;
+      const y = bot.entity.position.y;
+      bot.setControlState("jump", !!bot.entity.onGround && y < info.ledgeTop - 0.3);
+      bot.setControlState("forward", true);
+      if (settle < 0 && bot.entity.onGround && y >= info.ledgeTop - 0.1) settle = 0;
+      if (settle >= 0 && ++settle > 5) { finish(true); return; }
+      if (ticks > 45) finish(false);
+    };
+    stepAssist = { finish };
+    bot.on("physicsTick", onTick);
+    return true;
+  }
+
   // Unstick nudges. A 0.6-block-wide hitbox can wedge against a block corner
   // or keep bumping a ledge it cannot clear (jump lands on the edge, slides
   // back, repeat). Long before the full stall recovery, shake the bot loose:
@@ -826,6 +960,7 @@ function createNav(bot) {
     let moving = false;
     try { moving = !!(bot.pathfinder.isMoving && bot.pathfinder.isMoving()); } catch (e) {}
     if (!moving || typeof bot.setControlState !== "function") return;
+    if (tryStepUp("no progress")) { lastNudgeAt = now; return; }
     lastNudgeAt = now;
     const step = nudgeStep++ % 4;
     try {
@@ -928,8 +1063,7 @@ function createNav(bot) {
       // search. Record real displacement, but do not interrupt the search
       // until its timeout budget plus a grace period has elapsed.
       if (routeState === "partial" && lastProgressPosition) {
-        const partialMoved = bot.entity.position.distanceTo(lastProgressPosition);
-        if (partialMoved > 0.08) {
+        if (madeProgress()) {
           lastProgressPosition = bot.entity.position.clone();
           lastProgressAt = now;
           movementObserved = true;
@@ -949,10 +1083,7 @@ function createNav(bot) {
     }
     if (routeState === "failed") return;
 
-    const moved = lastProgressPosition
-      ? bot.entity.position.distanceTo(lastProgressPosition)
-      : Infinity;
-    if (moved > 0.08) {
+    if (madeProgress()) {
       lastProgressPosition = bot.entity.position.clone();
       lastProgressAt = now;
       movementObserved = true;
@@ -1080,6 +1211,7 @@ function createNav(bot) {
       });
     },
     stop() {
+      if (stepAssist) stepAssist.finish(false);
       if (escapeRetryTimer) clearTimeout(escapeRetryTimer);
       escapeRetryTimer = null;
       if (cancelGoalPromise) cancelGoalPromise(new Error("Navigation stopped"));

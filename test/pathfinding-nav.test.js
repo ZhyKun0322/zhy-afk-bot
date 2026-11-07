@@ -177,6 +177,58 @@ try {
     'unstick must cycle jump, strafe right/left and back: ' + [...pressed]);
   nav.stop();
 
+
+  // Step-up assist ("just jump"): a one-block ledge directly toward the target
+  // while the executor keeps bouncing. The bot must face it, hold forward+jump,
+  // and restore its goal once it stands on top.
+  const ledgeWorld = (pos) => {
+    const x = Math.floor(pos.x), y = Math.floor(pos.y), z = Math.floor(pos.z);
+    const mk = (name) => ({ name, boundingBox: name === 'air' ? 'empty' : 'block', shapes: name === 'air' ? [] : [[0, 0, 0, 1, 1, 1]], position: new Vec3(x, y, z) });
+    if (y <= 68) return mk('stone');            // ground
+    if (z === -1 && y === 69 && x === 0) return mk('grass_block'); // ledge north of the bot
+    return mk('air');
+  };
+  bot.blockAt = ledgeWorld;
+  bot.look = () => Promise.resolve();
+  const ctl2 = [];
+  bot.setControlState = (k, v) => ctl2.push([k, v]);
+  bot.clearControlStates = () => {};
+  bot.entity = { id: 1, height: 1.8, onGround: true, yaw: 0, position: new Vec3(0.5, 69, 0.3) };
+  const goalCalls2 = [];
+  bot.pathfinder.setGoal = (g, d) => { goalCalls2.push(g); bot.pathfinder.goal = g; bot.emit('goal_updated', g, d); };
+  fakeNow += 60000;
+  const north = { id: 31, height: 1.8, position: new Vec3(0.5, 70, -9.5) };
+  nav.follow(north, 2.25);
+  bot.emit('path_reset', 'stuck');
+  assert.equal(goalCalls2[goalCalls2.length - 1], null, 'path executor must be paused during the step-up');
+  bot.emit('physicsTick');
+  assert.ok(ctl2.some(([k, v]) => k === 'jump' && v === true), 'must hold jump at the ledge');
+  assert.ok(ctl2.some(([k, v]) => k === 'forward' && v === true), 'must hold forward');
+  // bot lands on top of the ledge
+  bot.entity.position = new Vec3(0.5, 70, -0.3);
+  for (let i = 0; i < 8; i++) bot.emit('physicsTick');
+  assert.notEqual(goalCalls2[goalCalls2.length - 1], null, 'goal must be restored after climbing');
+  nav.stop();
+
+  // Vertical bobbing (jump, fall back, repeat) must NOT count as progress.
+  const bob = { id: 41, height: 1.8, position: new Vec3(0.5, 70, -20.5) };
+  fakeNow += 60000;
+  bot.entity.position = new Vec3(0.5, 69, 0.3);
+  bot.blockAt = () => ({ name: 'air', boundingBox: 'empty', shapes: [], position: new Vec3(0, 0, 0) });
+  nav.follow(bob, 2.25);
+  bot.pathfinder.path = [{}];
+  bot.emit('path_update', { status: 'success', path: bot.pathfinder.path });
+  const ctl3 = [];
+  bot.setControlState = (k, v) => ctl3.push([k, v]);
+  bot.pathfinder.isMoving = () => true;
+  for (let i = 0; i < 6; i++) {
+    fakeNow += 500;
+    bot.entity.position = new Vec3(0.5, i % 2 ? 69 : 70.2, 0.3);
+    bot.emit('physicsTick');
+  }
+  assert.ok(nav.status().noProgressMs >= 2000, 'bobbing in place must register as no progress');
+  nav.stop();
+
   console.log('Pathfinding navigation regression tests passed.');
 } finally {
   Date.now = realNow;
